@@ -57,7 +57,7 @@ impl ScreenCapturer {
 impl VideoSource for ScreenCapturer {
     fn format(&self) -> VideoFormat {
         VideoFormat {
-            pixel_format: PixelFormat::Bgra,  // Fix 1: BGRA on Windows
+            pixel_format: PixelFormat::Rgba,  
             dimensions: [self.width, self.height],
         }
     }
@@ -102,7 +102,7 @@ impl VideoSource for ScreenCapturer {
 
         Ok(Some(VideoFrame {
             format: VideoFormat {
-                pixel_format: PixelFormat::Bgra,  // Fix 2: BGRA on Windows
+                pixel_format: PixelFormat::Rgba,  
                 dimensions: [raw_frame.width, raw_frame.height],
             },
             raw,
