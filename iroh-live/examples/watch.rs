@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Id, Vec2};
 use iroh::Endpoint;
@@ -64,6 +64,7 @@ fn main() -> Result<()> {
                 endpoint,
                 session,
                 rt,
+                target_fps: 30,
             };
             Ok(Box::new(app))
         }),
@@ -80,28 +81,35 @@ struct App {
     broadcast: SubscribeBroadcast,
     stats: StatsSmoother,
     rt: tokio::runtime::Runtime,
+    target_fps: u32,
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(16)); // min 30 fps
+        // Adjust repaint rate based on target FPS
+        let repaint_interval = Duration::from_millis(1000 / self.target_fps.max(15) as u64);
+        ctx.request_repaint_after(repaint_interval);
+
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(0.0).outer_margin(0.0))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
-                let avail = ui.available_size();
+                // Reserve space for the bottom overlay (approximate height)
+                let mut avail = ui.available_size();
+                avail.y -= 50.0; // Reserve space at bottom for overlay
+
                 ui.add_sized(avail, self.video.render(ctx, avail));
 
+                // Bottom horizontal overlay
                 egui::Area::new(Id::new("overlay"))
-                    .anchor(egui::Align2::LEFT_BOTTOM, [8.0, -8.0])
+                    .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -8.0])
                     .show(ctx, |ui| {
                         egui::Frame::new()
-                            .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 128))
+                            .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180))
                             .corner_radius(3.0)
+                            .inner_margin(8.0)
                             .show(ui, |ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                                ui.set_min_width(100.);
                                 self.render_overlay(ctx, ui);
                             })
                     })
@@ -118,9 +126,11 @@ impl eframe::App for App {
 
 impl App {
     fn render_overlay(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            // Quality selector
             let selected = self.video.track.rendition().to_owned();
-            egui::ComboBox::from_label("")
+            ui.label("Quality:");
+            egui::ComboBox::from_id_salt("quality")
                 .selected_text(selected.clone())
                 .show_ui(ui, |ui| {
                     for name in self.broadcast.video_renditions() {
@@ -137,9 +147,31 @@ impl App {
                     }
                 });
 
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            // FPS target selector
+            ui.label("Target FPS:");
+            egui::ComboBox::from_id_salt("fps")
+                .selected_text(format!("{}", self.target_fps))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.target_fps, 15, "15");
+                    ui.selectable_value(&mut self.target_fps, 30, "30");
+                    ui.selectable_value(&mut self.target_fps, 60, "60");
+                });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            // Metrics
             let (rtt, bw) = self.stats.smoothed(|| self.session.conn().stats());
-            ui.label(format!("BW:  {bw}"));
+            ui.label(format!("BW: {bw}"));
+            ui.add_space(10.0);
             ui.label(format!("RTT: {}ms", rtt.as_millis()));
+            ui.add_space(10.0);
+            ui.label(format!("FPS: {:.1}", self.video.fps()));
         });
     }
 }
@@ -148,6 +180,11 @@ struct VideoView {
     track: WatchTrack,
     texture: egui::TextureHandle,
     size: egui::Vec2,
+    // FPS tracking
+    frame_count: u32,
+    last_fps_update: Instant,
+    current_fps: f32,
+    last_frame_timestamp: Option<Duration>,
 }
 
 impl VideoView {
@@ -160,6 +197,10 @@ impl VideoView {
             size,
             texture,
             track,
+            frame_count: 0,
+            last_fps_update: Instant::now(),
+            current_fps: 0.0,
+            last_frame_timestamp: None,
         }
     }
 
@@ -172,14 +213,38 @@ impl VideoView {
             let h = (available_size.y * ppp) as u32;
             self.track.set_viewport(w, h);
         }
+
+        // Check for new frame
         if let Some(frame) = self.track.current_frame() {
-            let (w, h) = frame.img().dimensions();
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [w as usize, h as usize],
-                frame.img().as_raw(),
-            );
-            self.texture.set(image, Default::default());
+            let frame_timestamp = frame.timestamp;
+
+            // Only count if this is a new frame (different timestamp)
+            if self.last_frame_timestamp != Some(frame_timestamp) {
+                let (w, h) = frame.img().dimensions();
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    frame.img().as_raw(),
+                );
+                self.texture.set(image, Default::default());
+
+                // Count this unique frame
+                self.frame_count += 1;
+                self.last_frame_timestamp = Some(frame_timestamp);
+            }
         }
+
+        // Update FPS counter every second
+        let elapsed = self.last_fps_update.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            self.current_fps = self.frame_count as f32 / elapsed.as_secs_f32();
+            self.frame_count = 0;
+            self.last_fps_update = Instant::now();
+        }
+
         egui::Image::from_texture(&self.texture).shrink_to_fit()
+    }
+
+    fn fps(&self) -> f32 {
+        self.current_fps
     }
 }

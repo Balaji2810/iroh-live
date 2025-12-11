@@ -274,9 +274,9 @@ impl AudioRenditions {
 }
 
 pub struct VideoRenditions {
-    make_encoder: Box<dyn Fn(VideoPreset) -> Result<Box<dyn VideoEncoder>> + Send>,
+    make_encoder: Box<dyn Fn(u32, u32, u32) -> Result<Box<dyn VideoEncoder>> + Send>,
     source: SharedVideoSource,
-    renditions: HashMap<String, VideoPreset>,
+    renditions: HashMap<String, (u32, u32, u32)>, // width, height, fps
     _shared_source_cancel_guard: DropGuard,
 }
 
@@ -289,10 +289,34 @@ impl VideoRenditions {
         let source = SharedVideoSource::new(source, shutdown_token.clone());
         let renditions = presets
             .into_iter()
-            .map(|preset| (format!("video-{preset}"), preset))
+            .map(|preset| {
+                let (w, h) = preset.dimensions();
+                (format!("video-{preset}"), (w, h, preset.fps()))
+            })
             .collect();
         Self {
-            make_encoder: Box::new(|preset| Ok(Box::new(E::with_preset(preset)?))),
+            make_encoder: Box::new(|w, h, fps| Ok(Box::new(E::new(w, h, fps)?))),
+            renditions,
+            source,
+            _shared_source_cancel_guard: shutdown_token.drop_guard(),
+        }
+    }
+
+    pub fn new_with_fps<E: VideoEncoder>(
+        source: impl VideoSource,
+        presets: impl IntoIterator<Item = crate::av::VideoPresetWithFps>,
+    ) -> Self {
+        let shutdown_token = CancellationToken::new();
+        let source = SharedVideoSource::new(source, shutdown_token.clone());
+        let renditions = presets
+            .into_iter()
+            .map(|preset| {
+                let (w, h) = preset.dimensions();
+                (format!("video-{}", preset.preset), (w, h, preset.fps()))
+            })
+            .collect();
+        Self {
+            make_encoder: Box::new(|w, h, fps| Ok(Box::new(E::new(w, h, fps)?))),
             renditions,
             source,
             _shared_source_cancel_guard: shutdown_token.drop_guard(),
@@ -301,18 +325,18 @@ impl VideoRenditions {
 
     pub fn available_renditions(&self) -> Result<HashMap<String, VideoConfig>> {
         let mut renditions = HashMap::new();
-        for (name, preset) in self.renditions.iter() {
+        for (name, &(w, h, fps)) in self.renditions.iter() {
             // We need to create the encoder to get the config, even though we drop it
             // again (it will be created on deman). Not ideal, but works for now.
-            let config = (self.make_encoder)(*preset)?.config();
+            let config = (self.make_encoder)(w, h, fps)?.config();
             renditions.insert(name.clone(), config);
         }
         Ok(renditions)
     }
 
     pub fn encoder(&mut self, name: &str) -> Option<Result<Box<dyn VideoEncoder>>> {
-        let preset = self.renditions.get(name)?;
-        Some((self.make_encoder)(*preset))
+        let &(w, h, fps) = self.renditions.get(name)?;
+        Some((self.make_encoder)(w, h, fps))
     }
 
     pub fn start_encoder(

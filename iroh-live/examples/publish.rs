@@ -49,7 +49,10 @@ async fn main() -> n0_error::Result {
 
     // Use the already-initialized camera
     // let video = VideoRenditions::new::<H264Encoder>(camera, cli.video_presets);
-    let video = VideoRenditions::new::<H264Encoder>(screen, cli.video_presets);
+    let presets_with_fps = cli.video_presets.iter()
+        .map(|preset| preset.with_fps(cli.fps))
+        .collect::<Vec<_>>();
+    let video = VideoRenditions::new_with_fps::<H264Encoder>(screen, presets_with_fps);
     broadcast.set_video(Some(video))?;
 
     // Publish under the name "hello".
@@ -76,6 +79,8 @@ struct Cli {
     video_presets: Vec<VideoPreset>,
     #[arg(long, default_value_t=AudioPreset::Hq)]
     audio_preset: AudioPreset,
+    #[arg(long, default_value_t=30, help="Frame rate (FPS) for video encoding")]
+    fps: u32,
 }
 
 fn secret_key_from_env() -> n0_error::Result<SecretKey> {

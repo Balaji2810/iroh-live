@@ -87,6 +87,10 @@ pub trait VideoEncoder: VideoEncoderInner {
     fn with_preset(preset: VideoPreset) -> Result<Self>
     where
         Self: Sized;
+
+    fn new(width: u32, height: u32, framerate: u32) -> Result<Self>
+    where
+        Self: Sized;
 }
 
 pub trait VideoEncoderInner: Send + 'static {
@@ -196,6 +200,45 @@ impl VideoPreset {
 
     pub fn fps(&self) -> u32 {
         30
+    }
+
+    pub fn with_fps(self, fps: u32) -> VideoPresetWithFps {
+        VideoPresetWithFps { preset: self, fps }
+    }
+}
+
+/// VideoPreset with configurable frame rate
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct VideoPresetWithFps {
+    pub preset: VideoPreset,
+    pub fps: u32,
+}
+
+impl VideoPresetWithFps {
+    pub fn new(preset: VideoPreset, fps: u32) -> Self {
+        Self { preset, fps }
+    }
+
+    pub fn dimensions(&self) -> (u32, u32) {
+        self.preset.dimensions()
+    }
+
+    pub fn width(&self) -> u32 {
+        self.preset.width()
+    }
+
+    pub fn height(&self) -> u32 {
+        self.preset.height()
+    }
+
+    pub fn fps(&self) -> u32 {
+        self.fps
+    }
+}
+
+impl std::fmt::Display for VideoPresetWithFps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}fps", self.preset, self.fps)
     }
 }
 

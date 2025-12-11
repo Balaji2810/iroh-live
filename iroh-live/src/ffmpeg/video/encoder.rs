@@ -337,6 +337,13 @@ impl av::VideoEncoder for H264Encoder {
     {
         Self::new(preset.width(), preset.height(), preset.fps())
     }
+
+    fn new(width: u32, height: u32, framerate: u32) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        H264Encoder::new(width, height, framerate)
+    }
 }
 
 impl av::VideoEncoderInner for H264Encoder {
