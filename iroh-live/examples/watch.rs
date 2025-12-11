@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Id, Vec2};
@@ -55,21 +56,28 @@ fn main() -> Result<()> {
                 }
             }).expect("Failed to connect");
 
-            let app = App {
-                video: VideoView::new(&cc.egui_ctx, video),
-                _audio_ctx: audio_ctx,
-                _audio: audio,
+            let app = App::new(
+                cc.egui_ctx.clone(),
+                video,
+                audio_ctx,
+                audio,
                 broadcast,
-                stats: StatsSmoother::new(),
+                StatsSmoother::new(),
                 endpoint,
                 session,
                 rt,
-                target_fps: 30,
-            };
+                30,
+            );
             Ok(Box::new(app))
         }),
     )
     .map_err(|err| anyerr!("eframe failed: {err:#}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScalingMode {
+    Original,
+    Adaptive,
 }
 
 struct App {
@@ -82,6 +90,85 @@ struct App {
     stats: StatsSmoother,
     rt: tokio::runtime::Runtime,
     target_fps: u32,
+    selected_res: String,
+    scaling_mode: ScalingMode,
+}
+
+impl App {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        ctx: egui::Context,
+        video: WatchTrack,
+        audio_ctx: AudioBackend,
+        audio: AudioTrack,
+        broadcast: SubscribeBroadcast,
+        stats: StatsSmoother,
+        endpoint: Endpoint,
+        session: LiveSession,
+        rt: tokio::runtime::Runtime,
+        target_fps: u32,
+    ) -> Self {
+        let current_track = video.rendition().to_string();
+        let (selected_res, _) = Self::parse_track_name(&current_track);
+
+        Self {
+            video: VideoView::new(&ctx, video),
+            _audio: audio,
+            _audio_ctx: audio_ctx,
+            endpoint,
+            session,
+            broadcast,
+            stats,
+            rt,
+            target_fps,
+            selected_res,
+            scaling_mode: ScalingMode::Adaptive,
+        }
+    }
+
+    fn parse_track_name(name: &str) -> (String, String) {
+        // Expected format: video-{res}-{fps}fps (e.g. video-1080p-30fps)
+        // Fallback for old/simple format: video-{res} (e.g. video-1080p) -> assumes 30fps
+        let parts: Vec<&str> = name.split('-').collect();
+        if parts.len() >= 3 {
+            let res = parts[1].to_string();
+            let fps = parts[2].trim_end_matches("fps").to_string();
+            (res, fps)
+        } else if parts.len() == 2 {
+            (parts[1].to_string(), "30".to_string())
+        } else {
+            ("unknown".to_string(), "30".to_string())
+        }
+    }
+
+    fn available_options(&self) -> BTreeSet<String> {
+        let mut resolutions = BTreeSet::new();
+
+        for name in self.broadcast.video_renditions() {
+            let (res, _) = Self::parse_track_name(&name);
+            resolutions.insert(res);
+        }
+        resolutions
+    }
+
+    fn switch_track(&mut self, ctx: &egui::Context) {
+        // Enter the tokio runtime context before calling watch_rendition
+        let _guard = self.rt.enter();
+        
+        // Find any track with the selected resolution
+        for name in self.broadcast.video_renditions() {
+             let (res, _) = Self::parse_track_name(&name);
+             if res == self.selected_res {
+                 if let Ok(track) = self
+                    .broadcast
+                    .watch_rendition::<FfmpegVideoDecoder>(&Default::default(), &name)
+                {
+                    self.video = VideoView::new(ctx, track);
+                    break;
+                }
+             }
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -99,7 +186,7 @@ impl eframe::App for App {
                 let mut avail = ui.available_size();
                 avail.y -= 50.0; // Reserve space at bottom for overlay
 
-                ui.add_sized(avail, self.video.render(ctx, avail));
+                ui.add_sized(avail, self.video.render(ctx, avail, self.scaling_mode));
 
                 // Bottom horizontal overlay
                 egui::Area::new(Id::new("overlay"))
@@ -127,39 +214,37 @@ impl eframe::App for App {
 impl App {
     fn render_overlay(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            // Quality selector
-            let selected = self.video.track.rendition().to_owned();
+            let resolutions = self.available_options();
+
+            // Resolution selector
             ui.label("Quality:");
+            let old_res = self.selected_res.clone();
             egui::ComboBox::from_id_salt("quality")
-                .selected_text(selected.clone())
+                .selected_text(&self.selected_res)
                 .show_ui(ui, |ui| {
-                    for name in self.broadcast.video_renditions() {
-                        if ui.selectable_label(&selected == name, name).clicked() {
-                            // Enter the tokio runtime context before calling watch_rendition
-                            let _guard = self.rt.enter();
-                            if let Ok(track) = self
-                                .broadcast
-                                .watch_rendition::<FfmpegVideoDecoder>(&Default::default(), &name)
-                            {
-                                self.video = VideoView::new(ctx, track);
-                            }
-                        }
+                    for res in resolutions {
+                        ui.selectable_value(&mut self.selected_res, res.clone(), res);
                     }
                 });
-
+            
             ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(10.0);
-
-            // FPS target selector
-            ui.label("Target FPS:");
-            egui::ComboBox::from_id_salt("fps")
-                .selected_text(format!("{}", self.target_fps))
+            
+            // Scaling selector
+            ui.label("Scaling:");
+            egui::ComboBox::from_id_salt("scaling")
+                .selected_text(match self.scaling_mode {
+                    ScalingMode::Original => "Original",
+                    ScalingMode::Adaptive => "Adaptive",
+                })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.target_fps, 15, "15");
-                    ui.selectable_value(&mut self.target_fps, 30, "30");
-                    ui.selectable_value(&mut self.target_fps, 60, "60");
+                    ui.selectable_value(&mut self.scaling_mode, ScalingMode::Original, "Original");
+                    ui.selectable_value(&mut self.scaling_mode, ScalingMode::Adaptive, "Adaptive");
                 });
+
+            // If selection changed, try to switch track
+            if old_res != self.selected_res {
+                self.switch_track(ctx);
+            }
 
             ui.add_space(10.0);
             ui.separator();
@@ -204,18 +289,53 @@ impl VideoView {
         }
     }
 
-    fn render(&mut self, ctx: &egui::Context, available_size: Vec2) -> egui::Image<'_> {
-        let available_size = available_size.into();
-        if available_size != self.size {
-            self.size = available_size;
+    fn render(&mut self, ctx: &egui::Context, available_size: Vec2, scaling_mode: ScalingMode) -> egui::Image<'_> {
+        let available_size: egui::Vec2 = available_size.into();
+        
+        // Get the current frame ONCE at the start
+        let current_frame = self.track.current_frame();
+        
+        // Determine target size based on scaling mode
+        let target_size = match scaling_mode {
+            ScalingMode::Adaptive => {
+                // Respect aspect ratio when adapting
+                if let Some(ref frame) = current_frame {
+                    let (w, h) = frame.img().dimensions();
+                    let aspect = w as f32 / h as f32;
+                    let avail_aspect = available_size.x / available_size.y;
+                    
+                    if avail_aspect > aspect {
+                        // Limited by height
+                        egui::vec2(available_size.y * aspect, available_size.y)
+                    } else {
+                        // Limited by width
+                        egui::vec2(available_size.x, available_size.x / aspect)
+                    }
+                } else {
+                    available_size
+                }
+            },
+            ScalingMode::Original => {
+                if let Some(ref frame) = current_frame {
+                    let (w, h) = frame.img().dimensions();
+                    let ppp = ctx.pixels_per_point();
+                    egui::vec2(w as f32 / ppp, h as f32 / ppp)
+                } else {
+                    available_size
+                }
+            }
+        };
+
+        if target_size != self.size {
+            self.size = target_size;
             let ppp = ctx.pixels_per_point();
-            let w = (available_size.x * ppp) as u32;
-            let h = (available_size.y * ppp) as u32;
+            let w = (target_size.x * ppp) as u32;
+            let h = (target_size.y * ppp) as u32;
             self.track.set_viewport(w, h);
         }
 
-        // Check for new frame
-        if let Some(frame) = self.track.current_frame() {
+        // Use the already-fetched frame
+        if let Some(frame) = current_frame {
             let frame_timestamp = frame.timestamp;
 
             // Only count if this is a new frame (different timestamp)

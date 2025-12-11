@@ -174,11 +174,19 @@ pub enum VideoPreset {
     P720,
     #[strum(serialize = "1080p")]
     P1080,
+    #[strum(serialize = "1440p")]
+    P1440,
 }
 
 impl VideoPreset {
-    pub fn all() -> [VideoPreset; 4] {
-        [Self::P180, Self::P360, Self::P720, Self::P1080]
+    pub fn all() -> [VideoPreset; 5] {
+        [
+            Self::P180,
+            Self::P360,
+            Self::P720,
+            Self::P1080,
+            Self::P1440,
+        ]
     }
 
     pub fn dimensions(&self) -> (u32, u32) {
@@ -187,6 +195,7 @@ impl VideoPreset {
             Self::P360 => (640, 360),
             Self::P720 => (1280, 720),
             Self::P1080 => (1920, 1080),
+            Self::P1440 => (2560, 1440),
         }
     }
 

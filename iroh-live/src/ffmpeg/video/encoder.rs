@@ -94,10 +94,26 @@ impl H264Encoder {
         info!("Initializing H264 encoder: {width}x{height} @ {framerate}fps");
         ffmpeg::init()?;
 
-        // Bitrate heuristic (from your original)
+        // Calculate bitrate based on max bandwidth setting
+        let max_bitrate = std::env::var("IROH_MAX_BITRATE")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30_000_000); // Default 30 Mbps
+
+        // Calculate bitrate per preset based on resolution and framerate
+        // Distribute total bandwidth proportionally based on pixel count
         let pixels = width * height;
-        let framerate_factor = 30.0 + (framerate as f32 - 30.) / 2.;
-        let bitrate = (pixels as f32 * 0.07 * framerate_factor).round() as u64;
+        // Use a quality factor that scales with resolution
+        // This will automatically distribute bandwidth across quality levels
+        let quality_factor = 0.15; // bits per pixel per frame
+        let calculated_bitrate = (pixels as f32 * quality_factor * framerate as f32).round() as u64;
+
+        // Cap at max_bitrate
+        let bitrate = calculated_bitrate.min(max_bitrate);
+
+        info!("Encoder bitrate: {:.2} Mbps (max: {:.2} Mbps)",
+              bitrate as f32 / 1_000_000.0,
+              max_bitrate as f32 / 1_000_000.0);
 
         let opts = EncoderOpts {
             width,

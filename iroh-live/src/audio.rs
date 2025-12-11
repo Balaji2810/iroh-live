@@ -34,7 +34,13 @@ pub struct OutputControl {
 
 impl AudioSink for OutputControl {
     fn format(&self) -> Result<AudioFormat> {
-        let info = self.handle.lock().expect("poisoned");
+        let info = match self.handle.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("audio output stream lock poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
         let sample_rate = info
             .sample_rate()
             .context("output stream misses sample rate")?
@@ -47,7 +53,13 @@ impl AudioSink for OutputControl {
     }
 
     fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
-        let mut handle = self.handle.lock().unwrap();
+        let mut handle = match self.handle.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("audio output stream lock poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
 
         // If this happens excessively in Release mode, you may want to consider
         // increasing [`StreamWriterConfig::channel_config.latency_seconds`].
@@ -91,17 +103,19 @@ impl OutputControl {
 
     #[allow(unused)]
     pub fn is_active(&self) -> bool {
-        self.handle.lock().expect("poisoned").is_active()
+        self.handle.lock().map(|h| h.is_active()).unwrap_or_else(|e| e.into_inner().is_active())
     }
 
     pub fn pause(&self) {
         self.paused.store(true, Ordering::Relaxed);
-        self.handle.lock().expect("poisoned").pause_stream();
+        let mut handle = self.handle.lock().unwrap_or_else(|e| e.into_inner());
+        handle.pause_stream();
     }
 
     pub fn resume(&self) {
         self.paused.store(false, Ordering::Relaxed);
-        self.handle.lock().expect("poisoned").resume();
+        let mut handle = self.handle.lock().unwrap_or_else(|e| e.into_inner());
+        handle.resume();
     }
 }
 
@@ -135,7 +149,14 @@ impl AudioSource for MicrophoneSource {
 
     fn pop_samples(&mut self, buf: &mut [f32]) -> anyhow::Result<Option<usize>> {
         use firewheel::nodes::stream::ReadStatus;
-        let mut handle = self.handle.lock().expect("poisoned");
+        // Handle lock poisoning gracefully: acquire the lock even if poisoned
+        let mut handle = match self.handle.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("audio input stream lock poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
         match handle.read_interleaved(buf) {
             Some(ReadStatus::Ok) => Ok(Some(buf.len())),
             Some(ReadStatus::InputNotReady) => {

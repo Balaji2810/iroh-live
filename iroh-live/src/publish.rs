@@ -312,7 +312,7 @@ impl VideoRenditions {
             .into_iter()
             .map(|preset| {
                 let (w, h) = preset.dimensions();
-                (format!("video-{}", preset.preset), (w, h, preset.fps()))
+                (format!("video-{}-{}fps", preset.preset, preset.fps), (w, h, preset.fps()))
             })
             .collect();
         Self {

@@ -49,9 +49,16 @@ async fn main() -> n0_error::Result {
 
     // Use the already-initialized camera
     // let video = VideoRenditions::new::<H264Encoder>(camera, cli.video_presets);
+
+    // Set max bitrate from CLI arg (in Mbps, converted to bits/sec)
+    unsafe {
+        std::env::set_var("IROH_MAX_BITRATE", (cli.max_bandwidth * 1_000_000).to_string());
+    }
+
     let presets_with_fps = cli.video_presets.iter()
         .map(|preset| preset.with_fps(cli.fps))
         .collect::<Vec<_>>();
+
     let video = VideoRenditions::new_with_fps::<H264Encoder>(screen, presets_with_fps);
     broadcast.set_video(Some(video))?;
 
@@ -75,12 +82,14 @@ async fn main() -> n0_error::Result {
 struct Cli {
     #[arg(long, default_value_t=VideoCodec::H264)]
     codec: VideoCodec,
-    #[arg(long, value_delimiter=',', default_values_t=[VideoPreset::P180, VideoPreset::P360, VideoPreset::P720, VideoPreset::P1080])]
+    #[arg(long, value_delimiter=',', default_values_t=[VideoPreset::P180, VideoPreset::P360, VideoPreset::P720, VideoPreset::P1080, VideoPreset::P1440])]
     video_presets: Vec<VideoPreset>,
     #[arg(long, default_value_t=AudioPreset::Hq)]
     audio_preset: AudioPreset,
     #[arg(long, default_value_t=30, help="Frame rate (FPS) for video encoding")]
     fps: u32,
+    #[arg(long, default_value_t=30, value_parser=clap::value_parser!(u32).range(5..=50), help="Maximum bandwidth in Mbps (5-50, default: 30)")]
+    max_bandwidth: u32,
 }
 
 fn secret_key_from_env() -> n0_error::Result<SecretKey> {
