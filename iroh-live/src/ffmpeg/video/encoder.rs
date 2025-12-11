@@ -162,10 +162,14 @@ impl H264Encoder {
             (*ctx_mut).time_base.den = opts.framerate as i32;
             (*ctx_mut).framerate.num = opts.framerate as i32;
             (*ctx_mut).framerate.den = 1;
-            (*ctx_mut).gop_size = opts.framerate as i32;
+            (*ctx_mut).gop_size = 5;          // Keyframe every 5 frames (~167ms)
+            (*ctx_mut).max_b_frames = 0;      // No B-frames
+            (*ctx_mut).refs = 1;              // Single reference frame
             (*ctx_mut).bit_rate = opts.bitrate as i64;
             (*ctx_mut).flags = (*ctx_mut).flags | codec::Flags::GLOBAL_HEADER.bits() as c_int;
             (*ctx_mut).pix_fmt = backend.hardware_pixel_format().into();
+            // Force low delay flags
+            (*ctx_mut).flags2 = (*ctx_mut).flags2 | ffmpeg::sys::AV_CODEC_FLAG2_FAST;
         }
 
         // Backend-specific prep
@@ -182,16 +186,43 @@ impl H264Encoder {
         let enc_opts = {
             let mut opts = vec![
                 // Disable annexB so that we get an avcC header in extradata
-                // annexb=0 → MP4/ISO BMFF style (length-prefixed NAL units + avcC extradata),
-                // as opposed to Annex B start codes (00 00 00 01).
                 ("annexB", "0"),
             ];
-            if matches!(backend, HwBackend::Software) {
-                opts.extend_from_slice(&[
-                    ("preset", "ultrafast"),
-                    ("tune", "zerolatency"),
-                    ("profile", "baseline"),
-                ]);
+            match backend {
+                HwBackend::Software => {
+                    opts.extend_from_slice(&[
+                        ("preset", "ultrafast"),
+                        ("tune", "zerolatency"),
+                        ("profile", "baseline"),
+                    ]);
+                }
+                HwBackend::Nvenc => {
+                    opts.extend_from_slice(&[
+                        ("preset", "p1"),
+                        ("tune", "ull"),
+                        ("zerolatency", "1"),
+                        ("delay", "0"),
+                        ("rc", "cbr"),
+                        ("bf", "0"),
+                        ("lookahead", "0"),
+                        ("spatial-aq", "0"),
+                        ("temporal-aq", "0"),
+                        ("forced-idr", "1"),     // Force IDR frames
+                        ("no-scenecut", "1"),    // Disable scene detection
+                    ]);
+                }
+                HwBackend::Qsv => {
+                    opts.extend_from_slice(&[
+                        ("preset", "veryfast"),
+                        ("low_power", "1"),
+                    ]);
+                }
+                HwBackend::Amf => {
+                    opts.extend_from_slice(&[
+                        ("usage", "ultralowlatency"),
+                    ]);
+                }
+                _ => {}
             }
             ffmpeg::Dictionary::from_iter(opts.into_iter())
         };

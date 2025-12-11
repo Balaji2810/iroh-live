@@ -84,7 +84,7 @@ struct App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(30)); // min 30 fps
+        ctx.request_repaint_after(Duration::from_millis(16)); // min 30 fps
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(0.0).outer_margin(0.0))
             .show(ctx, |ui| {

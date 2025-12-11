@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap};
 
 use hang::{
     Catalog, CatalogConsumer, TrackConsumer,
@@ -204,7 +204,7 @@ impl AudioTrack {
         span: Span,
     ) -> Result<Self> {
         let _guard = span.enter();
-        let (packet_tx, packet_rx) = mpsc::channel(32);
+        let (packet_tx, packet_rx) = mpsc::channel(8);  // Reduced from 16 to 8
         let output_format = output.format()?;
         info!(?config, "audio thread start");
         let decoder = D::new(&config, output_format)?;
@@ -238,28 +238,52 @@ impl AudioTrack {
         mut sink: impl AudioSink,
         shutdown: &CancellationToken,
     ) -> Result<()> {
-        let mut last_timestamp = None;
+        use std::time::Instant;
+        
+        const MAX_BUFFER: usize = 6;    // Reduced from 10 - more aggressive
+        const TARGET_BUFFER: usize = 2;  // Reduced from 4
+        
+        let mut drop_counter: u64 = 0;
+        let mut last_packet_time = Instant::now();
+        
         while let Some(packet) = packet_rx.blocking_recv() {
-            debug!(len = packet.payload.len(), ts=?packet.timestamp, "recv packet");
-            let timestamp = packet.timestamp;
             if shutdown.is_cancelled() {
-                debug!("stop audio thread: cancelled");
                 break;
             }
+            
+            let now = Instant::now();
+            let time_since_last = now.duration_since(last_packet_time);
+            last_packet_time = now;
+            
+            // If gap > 300ms, reset buffer
+            if time_since_last.as_millis() > 300 {
+                while let Ok(stale) = packet_rx.try_recv() {
+                    let _ = decoder.push_packet(stale);
+                    let _ = decoder.pop_samples();
+                }
+            }
+            
+            let buffer_len = packet_rx.len();
+            
+            // More aggressive drift correction
+            if buffer_len > MAX_BUFFER {
+                let to_drop = buffer_len - TARGET_BUFFER;
+                for _ in 0..to_drop {
+                    if let Ok(dropped) = packet_rx.try_recv() {
+                        drop_counter += 1;
+                        let _ = decoder.push_packet(dropped);
+                        let _ = decoder.pop_samples();
+                    }
+                }
+                if drop_counter % 20 == 1 {
+                    warn!("drift correction: dropped {} total", drop_counter);
+                }
+            }
+            
             decoder.push_packet(packet)?;
             if let Some(samples) = decoder.pop_samples()? {
-                debug!("decoded {}", samples.len());
-                let delay = match last_timestamp {
-                    None => Duration::default(),
-                    Some(last_timestamp) => timestamp.saturating_sub(last_timestamp),
-                };
-                if delay > Duration::ZERO {
-                    debug!("sleep {delay:?}");
-                    std::thread::sleep(delay);
-                }
                 sink.push_samples(samples)?;
             }
-            last_timestamp = Some(timestamp);
         }
         Ok(())
     }
@@ -350,8 +374,8 @@ impl WatchTrack {
         shutdown: CancellationToken,
         span: Span,
     ) -> Result<Self> {
-        let (packet_tx, packet_rx) = mpsc::channel(32);
-        let (frame_tx, frame_rx) = mpsc::channel(32);
+        let (packet_tx, packet_rx) = mpsc::channel(4);
+        let (frame_tx, frame_rx) = mpsc::channel(2);
         let viewport = n0_watcher::Watchable::new((1u32, 1u32));
         let viewport_watcher = viewport.watch();
 

@@ -345,7 +345,8 @@ impl AudioDriver {
                 sample_rate.try_into().unwrap(),
                 output_stream_sample_rate,
                 ResamplingChannelConfig {
-                    capacity_seconds: 3.,
+                    capacity_seconds: 1.0,    // Allow up to 1 second buffer
+                    latency_seconds: 0.2,     // Start playback after 200ms buffered
                     ..Default::default()
                 },
             )
