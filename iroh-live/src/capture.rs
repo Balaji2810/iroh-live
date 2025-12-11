@@ -57,7 +57,7 @@ impl ScreenCapturer {
 impl VideoSource for ScreenCapturer {
     fn format(&self) -> VideoFormat {
         VideoFormat {
-            pixel_format: PixelFormat::Rgba,
+            pixel_format: PixelFormat::Bgra,  // Fix 1: BGRA on Windows
             dimensions: [self.width, self.height],
         }
     }
@@ -76,12 +76,36 @@ impl VideoSource for ScreenCapturer {
                 .recv()
                 .context("video recorder did not produce new frame")?,
         };
+
+        let width = raw_frame.width as usize;
+        let height = raw_frame.height as usize;
+        let row_bytes = width * 4;  // Expected bytes per row (no padding)
+        
+        // Calculate actual stride from buffer size
+        // DXGI frames often have padding at end of each row
+        let src_stride = raw_frame.raw.len() / height;
+        
+        let raw = if src_stride == row_bytes {
+            // No stride padding, use raw buffer directly
+            raw_frame.raw
+        } else {
+            // Strip stride padding - copy only the pixel data for each row
+            let mut stripped = vec![0u8; row_bytes * height];
+            for y in 0..height {
+                let src_off = y * src_stride;
+                let dst_off = y * row_bytes;
+                stripped[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&raw_frame.raw[src_off..src_off + row_bytes]);
+            }
+            stripped.into()
+        };
+
         Ok(Some(VideoFrame {
             format: VideoFormat {
-                pixel_format: PixelFormat::Rgba,
+                pixel_format: PixelFormat::Bgra,  // Fix 2: BGRA on Windows
                 dimensions: [raw_frame.width, raw_frame.height],
             },
-            raw: raw_frame.raw,
+            raw,
         }))
     }
 }
