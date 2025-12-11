@@ -164,39 +164,46 @@ pub enum VideoCodec {
     Av1,
 }
 
+/// Video quality preset - dimensions are calculated dynamically based on source aspect ratio
 #[derive(Debug, Clone, Copy, Display, EnumString, VariantNames, Eq, PartialEq, Ord, PartialOrd)]
 pub enum VideoPreset {
-    #[strum(serialize = "180p")]
-    P180,
-    #[strum(serialize = "360p")]
-    P360,
-    #[strum(serialize = "720p")]
-    P720,
-    #[strum(serialize = "1080p")]
-    P1080,
-    #[strum(serialize = "1440p")]
-    P1440,
+    #[strum(serialize = "poor")]
+    Poor,
+    #[strum(serialize = "medium")]
+    Medium,
+    #[strum(serialize = "good")]
+    Good,
+    #[strum(serialize = "best")]
+    Best,
 }
 
 impl VideoPreset {
-    pub fn all() -> [VideoPreset; 5] {
-        [
-            Self::P180,
-            Self::P360,
-            Self::P720,
-            Self::P1080,
-            Self::P1440,
-        ]
+    pub fn all() -> [VideoPreset; 4] {
+        [Self::Poor, Self::Medium, Self::Good, Self::Best]
     }
 
-    pub fn dimensions(&self) -> (u32, u32) {
+    /// Get base height for this quality level (width computed from aspect ratio)
+    pub fn base_height(&self) -> u32 {
         match self {
-            Self::P180 => (320, 180),
-            Self::P360 => (640, 360),
-            Self::P720 => (1280, 720),
-            Self::P1080 => (1920, 1080),
-            Self::P1440 => (2560, 1440),
+            Self::Poor => 360,
+            Self::Medium => 720,
+            Self::Good => 1080,
+            Self::Best => 1440,
         }
+    }
+
+    /// Calculate dimensions for a given source aspect ratio, preserving native ratio
+    pub fn dimensions_for_aspect(&self, source_width: u32, source_height: u32) -> (u32, u32) {
+        let height = self.base_height();
+        // Preserve source aspect ratio
+        let aspect = source_width as f32 / source_height as f32;
+        let width = ((height as f32 * aspect) as u32 / 2) * 2; // Ensure even number for encoder
+        (width, height)
+    }
+
+    /// Default dimensions (16:9 aspect ratio) - used when source aspect is unknown
+    pub fn dimensions(&self) -> (u32, u32) {
+        self.dimensions_for_aspect(16, 9)
     }
 
     pub fn width(&self) -> u32 {
@@ -212,32 +219,49 @@ impl VideoPreset {
     }
 
     pub fn with_fps(self, fps: u32) -> VideoPresetWithFps {
-        VideoPresetWithFps { preset: self, fps }
+        VideoPresetWithFps::new(self, fps)
+    }
+
+    /// Get human-readable display name for UI
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Poor => "Poor",
+            Self::Medium => "Medium",
+            Self::Good => "Good",
+            Self::Best => "Best",
+        }
     }
 }
 
-/// VideoPreset with configurable frame rate
+/// VideoPreset with configurable frame rate and source dimensions for aspect ratio preservation
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct VideoPresetWithFps {
     pub preset: VideoPreset,
     pub fps: u32,
+    pub source_width: u32,
+    pub source_height: u32,
 }
 
 impl VideoPresetWithFps {
     pub fn new(preset: VideoPreset, fps: u32) -> Self {
-        Self { preset, fps }
+        Self { preset, fps, source_width: 16, source_height: 9 }
+    }
+
+    /// Create preset with source dimensions for aspect ratio preservation
+    pub fn with_source_dimensions(preset: VideoPreset, fps: u32, source_width: u32, source_height: u32) -> Self {
+        Self { preset, fps, source_width, source_height }
     }
 
     pub fn dimensions(&self) -> (u32, u32) {
-        self.preset.dimensions()
+        self.preset.dimensions_for_aspect(self.source_width, self.source_height)
     }
 
     pub fn width(&self) -> u32 {
-        self.preset.width()
+        self.dimensions().0
     }
 
     pub fn height(&self) -> u32 {
-        self.preset.height()
+        self.dimensions().1
     }
 
     pub fn fps(&self) -> u32 {

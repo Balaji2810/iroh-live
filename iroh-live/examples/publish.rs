@@ -47,16 +47,20 @@ async fn main() -> n0_error::Result {
     let audio = AudioRenditions::new::<OpusEncoder>(mic, [cli.audio_preset]);
     broadcast.set_audio(Some(audio))?;
 
-    // Use the already-initialized camera
-    // let video = VideoRenditions::new::<H264Encoder>(camera, cli.video_presets);
-
     // Set max bitrate from CLI arg (in Mbps, converted to bits/sec)
     unsafe {
         std::env::set_var("IROH_MAX_BITRATE", (cli.max_bandwidth * 1_000_000).to_string());
     }
 
+    // Get source dimensions from screen capture to preserve native aspect ratio
+    use iroh_live::av::VideoSource;
+    let source_format = screen.format();
+    let [source_width, source_height] = source_format.dimensions;
+
+    // Create presets with source dimensions for aspect ratio preservation
+    use iroh_live::av::VideoPresetWithFps;
     let presets_with_fps = cli.video_presets.iter()
-        .map(|preset| preset.with_fps(cli.fps))
+        .map(|preset| VideoPresetWithFps::with_source_dimensions(*preset, cli.fps, source_width, source_height))
         .collect::<Vec<_>>();
 
     let video = VideoRenditions::new_with_fps::<H264Encoder>(screen, presets_with_fps);
@@ -82,7 +86,7 @@ async fn main() -> n0_error::Result {
 struct Cli {
     #[arg(long, default_value_t=VideoCodec::H264)]
     codec: VideoCodec,
-    #[arg(long, value_delimiter=',', default_values_t=[VideoPreset::P180, VideoPreset::P360, VideoPreset::P720, VideoPreset::P1080, VideoPreset::P1440])]
+    #[arg(long, value_delimiter=',', default_values_t=[VideoPreset::Poor, VideoPreset::Medium, VideoPreset::Good, VideoPreset::Best])]
     video_presets: Vec<VideoPreset>,
     #[arg(long, default_value_t=AudioPreset::Hq)]
     audio_preset: AudioPreset,

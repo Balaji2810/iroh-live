@@ -312,6 +312,7 @@ impl VideoRenditions {
             .into_iter()
             .map(|preset| {
                 let (w, h) = preset.dimensions();
+                // Track name format: video-{quality}-{fps}fps (e.g. video-best-30fps)
                 (format!("video-{}-{}fps", preset.preset, preset.fps), (w, h, preset.fps()))
             })
             .collect();

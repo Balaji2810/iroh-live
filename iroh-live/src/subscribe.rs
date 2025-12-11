@@ -166,10 +166,10 @@ pub(crate) fn select_video_rendition<'a, T>(
 ) -> Option<String> {
     use crate::av::VideoPreset::*;
     let order = match q {
-        Quality::Highest => [P1080, P720, P360, P180],
-        Quality::High => [P720, P360, P180, P1080],
-        Quality::Mid => [P360, P180, P720, P1080],
-        Quality::Low => [P180, P360, P720, P1080],
+        Quality::Highest => [Best, Good, Medium, Poor],
+        Quality::High => [Good, Medium, Poor, Best],
+        Quality::Mid => [Medium, Poor, Good, Best],
+        Quality::Low => [Poor, Medium, Good, Best],
     };
 
     select_rendition(renditions, &order)

@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Id, Vec2};
@@ -127,13 +126,13 @@ impl App {
     }
 
     fn parse_track_name(name: &str) -> (String, String) {
-        // Expected format: video-{res}-{fps}fps (e.g. video-1080p-30fps)
-        // Fallback for old/simple format: video-{res} (e.g. video-1080p) -> assumes 30fps
+        // Expected format: video-{quality}-{fps}fps (e.g. video-best-30fps)
+        // Fallback for old/simple format: video-{quality} (e.g. video-best) -> assumes 30fps
         let parts: Vec<&str> = name.split('-').collect();
         if parts.len() >= 3 {
-            let res = parts[1].to_string();
+            let quality = parts[1].to_string();
             let fps = parts[2].trim_end_matches("fps").to_string();
-            (res, fps)
+            (quality, fps)
         } else if parts.len() == 2 {
             (parts[1].to_string(), "30".to_string())
         } else {
@@ -141,14 +140,51 @@ impl App {
         }
     }
 
-    fn available_options(&self) -> BTreeSet<String> {
-        let mut resolutions = BTreeSet::new();
-
-        for name in self.broadcast.video_renditions() {
-            let (res, _) = Self::parse_track_name(&name);
-            resolutions.insert(res);
+    /// Convert quality string to display name
+    fn quality_display_name(quality: &str) -> &'static str {
+        match quality {
+            "poor" => "Poor",
+            "medium" => "Medium",
+            "good" => "Good",
+            "best" => "Best",
+            // Legacy resolution names fallback
+            "180p" => "Poor",
+            "360p" => "Poor",
+            "720p" => "Medium",
+            "1080p" => "Good",
+            "1440p" => "Best",
+            _ => "Unknown",
         }
-        resolutions
+    }
+
+    fn available_options(&self) -> Vec<(String, &'static str)> {
+        // Return (quality_key, display_name) pairs in order: poor, medium, good, best
+        let mut options = Vec::new();
+        let quality_order = ["poor", "medium", "good", "best"];
+        
+        for quality in quality_order {
+            for name in self.broadcast.video_renditions() {
+                let (q, _) = Self::parse_track_name(&name);
+                if q == quality {
+                    options.push((q, Self::quality_display_name(quality)));
+                    break;
+                }
+            }
+        }
+        
+        // Also check for legacy resolution names
+        let legacy_order = ["180p", "360p", "720p", "1080p", "1440p"];
+        for res in legacy_order {
+            for name in self.broadcast.video_renditions() {
+                let (r, _) = Self::parse_track_name(&name);
+                if r == res && !options.iter().any(|(k, _)| k == res) {
+                    options.push((r.clone(), Self::quality_display_name(&r)));
+                    break;
+                }
+            }
+        }
+        
+        options
     }
 
     fn switch_track(&mut self, ctx: &egui::Context) {
@@ -214,16 +250,20 @@ impl eframe::App for App {
 impl App {
     fn render_overlay(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let resolutions = self.available_options();
+            let options = self.available_options();
 
-            // Resolution selector
+            // Quality selector with human-readable names
             ui.label("Quality:");
             let old_res = self.selected_res.clone();
+            
+            // Find display name for current selection
+            let current_display = Self::quality_display_name(&self.selected_res);
+            
             egui::ComboBox::from_id_salt("quality")
-                .selected_text(&self.selected_res)
+                .selected_text(current_display)
                 .show_ui(ui, |ui| {
-                    for res in resolutions {
-                        ui.selectable_value(&mut self.selected_res, res.clone(), res);
+                    for (quality_key, display_name) in &options {
+                        ui.selectable_value(&mut self.selected_res, quality_key.clone(), *display_name);
                     }
                 });
             
