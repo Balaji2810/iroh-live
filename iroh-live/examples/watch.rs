@@ -125,6 +125,8 @@ impl App {
                 .show_ui(ui, |ui| {
                     for name in self.broadcast.video_renditions() {
                         if ui.selectable_label(&selected == name, name).clicked() {
+                            // Enter the tokio runtime context before calling watch_rendition
+                            let _guard = self.rt.enter();
                             if let Ok(track) = self
                                 .broadcast
                                 .watch_rendition::<FfmpegVideoDecoder>(&Default::default(), &name)
