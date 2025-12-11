@@ -5,8 +5,13 @@ use iroh_live::{
     audio::AudioBackend,
     av::{AudioPreset, VideoCodec, VideoPreset},
     capture::CameraCapturer,
-    ffmpeg::{H264Encoder, OpusEncoder},
-    publish::{AudioRenditions, PublishBroadcast, VideoRenditions},
+    capture::ScreenCapturer,
+    ffmpeg::{H264Encoder, 
+        OpusEncoder
+    },
+    publish::{
+        AudioRenditions, 
+        PublishBroadcast, VideoRenditions},
     ticket::LiveTicket,
 };
 use n0_error::StdResultExt;
@@ -16,7 +21,12 @@ async fn main() -> n0_error::Result {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
-    // Setup audio backend.
+    // Initialize camera FIRST, before audio backend
+    // This ensures MediaFoundation gets to set COM threading model
+    let _camera = CameraCapturer::new()?;
+    let screen = ScreenCapturer::new()?;
+
+    // Setup audio backend AFTER camera
     let audio_ctx = AudioBackend::new();
 
     // Setup iroh and iroh-live.
@@ -37,9 +47,9 @@ async fn main() -> n0_error::Result {
     let audio = AudioRenditions::new::<OpusEncoder>(mic, [cli.audio_preset]);
     broadcast.set_audio(Some(audio))?;
 
-    // Capture camera, and encode with the cli-provided presets.
-    let camera = CameraCapturer::new()?;
-    let video = VideoRenditions::new::<H264Encoder>(camera, cli.video_presets);
+    // Use the already-initialized camera
+    // let video = VideoRenditions::new::<H264Encoder>(camera, cli.video_presets);
+    let video = VideoRenditions::new::<H264Encoder>(screen, cli.video_presets);
     broadcast.set_video(Some(video))?;
 
     // Publish under the name "hello".

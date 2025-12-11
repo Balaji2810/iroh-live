@@ -21,34 +21,40 @@ fn main() -> Result<()> {
         .context("missing ticket")?;
     let ticket = LiveTicket::deserialize(&ticket_str)?;
 
-    let audio_ctx = AudioBackend::new();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
     println!("connecting to {ticket} ...");
-    let (endpoint, session, broadcast, video, audio) = rt.block_on({
-        let audio_ctx = audio_ctx.clone();
-        async move {
-            let endpoint = Endpoint::bind().await?;
-            let live = Live::new(endpoint.clone());
-            let mut session = live.connect(ticket.endpoint_id).await?;
-            println!("connected!");
-            let consumer = session.subscribe(&ticket.broadcast_name).await?;
-            let broadcast = SubscribeBroadcast::new(consumer).await?;
-            let audio_out = audio_ctx.default_speaker().await?;
-            let audio = broadcast.listen::<FfmpegAudioDecoder>(audio_out)?;
-            let video = broadcast.watch::<FfmpegVideoDecoder>()?;
-            n0_error::Ok((endpoint, session, broadcast, video, audio))
-        }
-    })?;
 
-    let _guard = rt.enter();
+    // Start eframe FIRST - before any async/network code
+    // This ensures winit initializes COM correctly
     eframe::run_native(
         "IrohLive",
         eframe::NativeOptions::default(),
-        Box::new(|cc| {
+        Box::new(move |cc| {
+            // Create tokio runtime INSIDE eframe callback
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            // Initialize audio backend
+            let audio_ctx = AudioBackend::new();
+
+            // Now do the connection
+            let (endpoint, session, broadcast, video, audio) = rt.block_on({
+                let audio_ctx = audio_ctx.clone();
+                async move {
+                    let endpoint = Endpoint::bind().await?;
+                    let live = Live::new(endpoint.clone());
+                    let mut session = live.connect(ticket.endpoint_id).await?;
+                    println!("connected!");
+                    let consumer = session.subscribe(&ticket.broadcast_name).await?;
+                    let broadcast = SubscribeBroadcast::new(consumer).await?;
+                    let audio_out = audio_ctx.default_speaker().await?;
+                    let audio = broadcast.listen::<FfmpegAudioDecoder>(audio_out)?;
+                    let video = broadcast.watch::<FfmpegVideoDecoder>()?;
+                    n0_error::Ok((endpoint, session, broadcast, video, audio))
+                }
+            }).expect("Failed to connect");
+
             let app = App {
                 video: VideoView::new(&cc.egui_ctx, video),
                 _audio_ctx: audio_ctx,
