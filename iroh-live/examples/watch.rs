@@ -121,7 +121,7 @@ impl App {
             rt,
             target_fps,
             selected_res,
-            scaling_mode: ScalingMode::Adaptive,
+            scaling_mode: ScalingMode::Original,
         }
     }
 
@@ -310,6 +310,7 @@ struct VideoView {
     last_fps_update: Instant,
     current_fps: f32,
     last_frame_timestamp: Option<Duration>,
+    viewport_initialized: bool,
 }
 
 impl VideoView {
@@ -326,51 +327,35 @@ impl VideoView {
             last_fps_update: Instant::now(),
             current_fps: 0.0,
             last_frame_timestamp: None,
+            viewport_initialized: false,
         }
     }
 
-    fn render(&mut self, ctx: &egui::Context, available_size: Vec2, scaling_mode: ScalingMode) -> egui::Image<'_> {
+    fn render(&mut self, ctx: &egui::Context, available_size: Vec2, _scaling_mode: ScalingMode) -> egui::Image<'_> {
         let available_size: egui::Vec2 = available_size.into();
         
         // Get the current frame ONCE at the start
         let current_frame = self.track.current_frame();
         
-        // Determine target size based on scaling mode
-        let target_size = match scaling_mode {
-            ScalingMode::Adaptive => {
-                // Respect aspect ratio when adapting
-                if let Some(ref frame) = current_frame {
-                    let (w, h) = frame.img().dimensions();
-                    let aspect = w as f32 / h as f32;
-                    let avail_aspect = available_size.x / available_size.y;
-                    
-                    if avail_aspect > aspect {
-                        // Limited by height
-                        egui::vec2(available_size.y * aspect, available_size.y)
-                    } else {
-                        // Limited by width
-                        egui::vec2(available_size.x, available_size.x / aspect)
-                    }
-                } else {
-                    available_size
-                }
-            },
-            ScalingMode::Original => {
-                if let Some(ref frame) = current_frame {
-                    let (w, h) = frame.img().dimensions();
-                    let ppp = ctx.pixels_per_point();
-                    egui::vec2(w as f32 / ppp, h as f32 / ppp)
-                } else {
-                    available_size
-                }
-            }
-        };
-
-        if target_size != self.size {
-            self.size = target_size;
+        // Initialize viewport once based on available size (not frame size)
+        if !self.viewport_initialized {
+            self.viewport_initialized = true;
+            self.size = available_size;
             let ppp = ctx.pixels_per_point();
-            let w = (target_size.x * ppp) as u32;
-            let h = (target_size.y * ppp) as u32;
+            let w = (available_size.x * ppp) as u32;
+            let h = (available_size.y * ppp) as u32;
+            self.track.set_viewport(w, h);
+        }
+        
+        // Only update viewport on significant available_size changes (window resize)
+        const SIZE_THRESHOLD: f32 = 5.0;
+        let size_diff = (available_size - self.size).length();
+        
+        if size_diff > SIZE_THRESHOLD {
+            self.size = available_size;
+            let ppp = ctx.pixels_per_point();
+            let w = (available_size.x * ppp) as u32;
+            let h = (available_size.y * ppp) as u32;
             self.track.set_viewport(w, h);
         }
 
@@ -401,7 +386,8 @@ impl VideoView {
             self.last_fps_update = Instant::now();
         }
 
-        egui::Image::from_texture(&self.texture).shrink_to_fit()
+        // Use fit_to_exact_size for stable display
+        egui::Image::from_texture(&self.texture).fit_to_exact_size(self.size)
     }
 
     fn fps(&self) -> f32 {
