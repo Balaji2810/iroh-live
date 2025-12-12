@@ -432,6 +432,11 @@ impl EncoderThread {
                 );
                 let framerate = encoder.config().framerate.unwrap_or(30.0);
                 let interval = Duration::from_secs_f64(1. / framerate);
+                
+                // Latency tracking
+                let mut delay_samples: Vec<Duration> = Vec::new();
+                let mut last_log = Instant::now();
+                
                 loop {
                     let start = Instant::now();
                     if shutdown.is_cancelled() {
@@ -446,14 +451,25 @@ impl EncoderThread {
                         }
                     };
                     if let Some(frame) = frame {
+                        let capture_time = Instant::now();
                         if let Err(err) = encoder.push_frame(frame) {
                             warn!("video encoder failed: {err:#}");
                             break;
                         };
                         while let Ok(Some(pkt)) = encoder.pop_packet() {
                             producer.write(pkt);
+                            delay_samples.push(capture_time.elapsed());
                         }
                     }
+                    
+                    // Log 5-second average publish delay
+                    if last_log.elapsed() >= Duration::from_secs(5) && !delay_samples.is_empty() {
+                        let avg = delay_samples.iter().sum::<Duration>() / delay_samples.len() as u32;
+                        info!("video publish delay avg: {:?} ({} samples)", avg, delay_samples.len());
+                        delay_samples.clear();
+                        last_log = Instant::now();
+                    }
+                    
                     std::thread::sleep(interval.saturating_sub(start.elapsed()));
                 }
                 tracing::debug!("video encoder thread stop");
@@ -482,6 +498,11 @@ impl EncoderThread {
             let format = source.format();
             let samples_per_frame = (format.sample_rate / 1000) * INTERVAL.as_millis() as u32;
             let mut buf = vec![0.0f32; samples_per_frame as usize * format.channel_count as usize];
+            
+            // Latency tracking
+            let mut delay_samples: Vec<Duration> = Vec::new();
+            let mut last_log = Instant::now();
+            
             loop {
                 trace!("tick");
                 let start = Instant::now();
@@ -490,6 +511,7 @@ impl EncoderThread {
                 }
                 match source.pop_samples(&mut buf) {
                     Ok(Some(_n)) => {
+                        let capture_time = Instant::now();
                         // Expect a full frame; if shorter, zero-pad via slice len
                         if let Err(err) = encoder.push_samples(&buf) {
                             error!("audio push_samples failed: {err:#}");
@@ -497,6 +519,7 @@ impl EncoderThread {
                         }
                         while let Ok(Some(pkt)) = encoder.pop_packet() {
                             producer.write(pkt);
+                            delay_samples.push(capture_time.elapsed());
                         }
                     }
                     Ok(None) => {
@@ -507,6 +530,15 @@ impl EncoderThread {
                         break;
                     }
                 }
+                
+                // Log 5-second average publish delay
+                if last_log.elapsed() >= Duration::from_secs(5) && !delay_samples.is_empty() {
+                    let avg = delay_samples.iter().sum::<Duration>() / delay_samples.len() as u32;
+                    info!("audio publish delay avg: {:?} ({} samples)", avg, delay_samples.len());
+                    delay_samples.clear();
+                    last_log = Instant::now();
+                }
+                
                 let elapsed = start.elapsed();
                 if elapsed > INTERVAL {
                     warn!(

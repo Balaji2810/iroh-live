@@ -204,7 +204,7 @@ impl AudioTrack {
         span: Span,
     ) -> Result<Self> {
         let _guard = span.enter();
-        let (packet_tx, packet_rx) = mpsc::channel(8);  // Reduced from 16 to 8
+        let (packet_tx, packet_rx) = mpsc::channel(3);  // Low-latency: ~60ms max buffer (3 × 20ms)
         let output_format = output.format()?;
         info!(?config, "audio thread start");
         let decoder = D::new(&config, output_format)?;
@@ -238,22 +238,26 @@ impl AudioTrack {
         mut sink: impl AudioSink,
         shutdown: &CancellationToken,
     ) -> Result<()> {
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
         
-        const MAX_BUFFER: usize = 6;    // Reduced from 10 - more aggressive
-        const TARGET_BUFFER: usize = 2;  // Reduced from 4
+        const MAX_BUFFER: usize = 2;    // Low-latency: drop if more than 2 packets queued
+        const TARGET_BUFFER: usize = 1;  // Low-latency: target 1 packet in buffer
         
         let mut drop_counter: u64 = 0;
         let mut last_packet_time = Instant::now();
+        
+        // Latency tracking
+        let mut delay_samples: Vec<Duration> = Vec::new();
+        let mut last_log = Instant::now();
         
         while let Some(packet) = packet_rx.blocking_recv() {
             if shutdown.is_cancelled() {
                 break;
             }
             
-            let now = Instant::now();
-            let time_since_last = now.duration_since(last_packet_time);
-            last_packet_time = now;
+            let arrival_time = Instant::now();
+            let time_since_last = arrival_time.duration_since(last_packet_time);
+            last_packet_time = arrival_time;
             
             // If gap > 300ms, reset buffer
             if time_since_last.as_millis() > 300 {
@@ -283,6 +287,15 @@ impl AudioTrack {
             decoder.push_packet(packet)?;
             if let Some(samples) = decoder.pop_samples()? {
                 sink.push_samples(samples)?;
+                delay_samples.push(arrival_time.elapsed());
+            }
+            
+            // Log 5-second average watch delay
+            if last_log.elapsed() >= Duration::from_secs(5) && !delay_samples.is_empty() {
+                let avg = delay_samples.iter().sum::<Duration>() / delay_samples.len() as u32;
+                info!("audio watch delay avg: {:?} ({} samples)", avg, delay_samples.len());
+                delay_samples.clear();
+                last_log = Instant::now();
             }
         }
         Ok(())
@@ -414,6 +427,12 @@ impl WatchTrack {
         mut viewport_watcher: n0_watcher::Direct<(u32, u32)>,
         mut decoder: impl VideoDecoder,
     ) -> Result<(), anyhow::Error> {
+        use std::time::{Duration, Instant};
+        
+        // Latency tracking
+        let mut delay_samples: Vec<Duration> = Vec::new();
+        let mut last_log = Instant::now();
+        
         loop {
             if shutdown.is_cancelled() {
                 break;
@@ -421,6 +440,8 @@ impl WatchTrack {
             let Some(packet) = packet_rx.blocking_recv() else {
                 break;
             };
+            let arrival_time = Instant::now();
+            
             if viewport_watcher.update() {
                 let (w, h) = viewport_watcher.peek();
                 decoder.set_viewport(*w, *h);
@@ -432,6 +453,15 @@ impl WatchTrack {
                 if frame_tx.blocking_send(frame).is_err() {
                     break;
                 }
+                delay_samples.push(arrival_time.elapsed());
+            }
+            
+            // Log 5-second average watch delay
+            if last_log.elapsed() >= Duration::from_secs(5) && !delay_samples.is_empty() {
+                let avg = delay_samples.iter().sum::<Duration>() / delay_samples.len() as u32;
+                info!("video watch delay avg: {:?} ({} samples)", avg, delay_samples.len());
+                delay_samples.clear();
+                last_log = Instant::now();
             }
         }
         Ok(())
