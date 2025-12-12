@@ -206,7 +206,12 @@ impl AudioTrack {
         let _guard = span.enter();
         let (packet_tx, packet_rx) = mpsc::channel(3);  // Low-latency: ~60ms max buffer (3 × 20ms)
         let output_format = output.format()?;
-        info!(?config, "audio thread start");
+        info!(
+            ?config,
+            output_sample_rate = output_format.sample_rate,
+            output_channels = output_format.channel_count,
+            "audio thread start"
+        );
         let decoder = D::new(&config, output_format)?;
         let thread = std::thread::spawn({
             let shutdown = shutdown.clone();

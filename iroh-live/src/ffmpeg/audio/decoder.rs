@@ -1,6 +1,7 @@
 use anyhow::Result;
 use ffmpeg_next::{self as ffmpeg, util::channel_layout::ChannelLayout};
 use hang::catalog::AudioConfig;
+use tracing::info;
 
 use crate::{
     av::{AudioDecoder, AudioFormat},
@@ -53,10 +54,27 @@ impl AudioDecoder for FfmpegAudioDecoder {
         let target_sample_format = ffmpeg_next::util::format::sample::Sample::F32(
             ffmpeg_next::util::format::sample::Type::Packed,
         );
+        // Log sample rates for debugging
+        info!(
+            "Audio decoder: source_rate={} (from config: {}), target_rate={}, channels={}->{}",
+            codec.rate(),
+            config.sample_rate,
+            target_format.sample_rate,
+            config.channel_count,
+            target_format.channel_count
+        );
+        
+        // Use config.sample_rate as source rate since codec.rate() may not be set yet
+        let source_rate = if codec.rate() == 0 {
+            config.sample_rate
+        } else {
+            codec.rate()
+        };
+        
         let resampler = ffmpeg::software::resampling::Context::get(
             codec.format(),
             codec.channel_layout(),
-            codec.rate(),
+            source_rate,
             target_sample_format,
             target_channel_layout,
             target_format.sample_rate,

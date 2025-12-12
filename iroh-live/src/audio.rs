@@ -358,6 +358,10 @@ impl AudioDriver {
             .connect(stream_writer_id, graph_out_node_id, layout, false)
             .unwrap();
         let output_stream_sample_rate = self.cx.stream_info().unwrap().sample_rate;
+        info!(
+            "Audio output: app_rate={}, hardware_rate={:?}",
+            sample_rate, output_stream_sample_rate
+        );
         let event = self
             .cx
             .node_state_mut::<StreamWriterState>(stream_writer_id)
@@ -414,6 +418,10 @@ impl AudioDriver {
             .unwrap();
 
         let input_stream_sample_rate = self.cx.stream_info().unwrap().sample_rate;
+        info!(
+            "Audio input: app_rate={}, hardware_rate={:?}",
+            sample_rate, input_stream_sample_rate
+        );
         let event = self
             .cx
             .node_state_mut::<StreamReaderState>(stream_reader_id)
