@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{anyhow, Context};
 use hang::{
     Catalog, CatalogProducer,
     catalog::{AudioConfig, VideoConfig},
@@ -302,6 +303,33 @@ impl VideoRenditions {
         }
     }
 
+    /// Like [`VideoRenditions::new`], but constructs the video source inside the
+    /// capture thread (see [`SharedVideoSource::new_lazy`]).
+    pub fn new_lazy<E, S>(
+        make_source: impl FnOnce() -> anyhow::Result<S> + Send + 'static,
+        presets: impl IntoIterator<Item = VideoPreset>,
+    ) -> Result<Self>
+    where
+        E: VideoEncoder,
+        S: VideoSource,
+    {
+        let shutdown_token = CancellationToken::new();
+        let source = SharedVideoSource::new_lazy(make_source, shutdown_token.clone())?;
+        let renditions = presets
+            .into_iter()
+            .map(|preset| {
+                let (w, h) = preset.dimensions();
+                (format!("video-{preset}"), (w, h, preset.fps()))
+            })
+            .collect();
+        Ok(Self {
+            make_encoder: Box::new(|w, h, fps| Ok(Box::new(E::new(w, h, fps)?))),
+            renditions,
+            source,
+            _shared_source_cancel_guard: shutdown_token.drop_guard(),
+        })
+    }
+
     pub fn new_with_fps<E: VideoEncoder>(
         source: impl VideoSource,
         presets: impl IntoIterator<Item = crate::av::VideoPresetWithFps>,
@@ -322,6 +350,34 @@ impl VideoRenditions {
             source,
             _shared_source_cancel_guard: shutdown_token.drop_guard(),
         }
+    }
+
+    /// Like [`VideoRenditions::new_with_fps`], but constructs the video source
+    /// inside the capture thread (see [`SharedVideoSource::new_lazy`]).
+    pub fn new_with_fps_lazy<E, S>(
+        make_source: impl FnOnce() -> anyhow::Result<S> + Send + 'static,
+        presets: impl IntoIterator<Item = crate::av::VideoPresetWithFps>,
+    ) -> Result<Self>
+    where
+        E: VideoEncoder,
+        S: VideoSource,
+    {
+        let shutdown_token = CancellationToken::new();
+        let source = SharedVideoSource::new_lazy(make_source, shutdown_token.clone())?;
+        let renditions = presets
+            .into_iter()
+            .map(|preset| {
+                let (w, h) = preset.dimensions();
+                // Track name format: video-{quality}-{fps}fps (e.g. video-best-30fps)
+                (format!("video-{}-{}fps", preset.preset, preset.fps), (w, h, preset.fps()))
+            })
+            .collect();
+        Ok(Self {
+            make_encoder: Box::new(|w, h, fps| Ok(Box::new(E::new(w, h, fps)?))),
+            renditions,
+            source,
+            _shared_source_cancel_guard: shutdown_token.drop_guard(),
+        })
     }
 
     pub fn available_renditions(&self) -> Result<HashMap<String, VideoConfig>> {
@@ -393,6 +449,61 @@ impl SharedVideoSource {
             format,
             frames_rx: rx,
         }
+    }
+
+    /// Construct the underlying capture source inside the spawned capture thread.
+    ///
+    /// On Windows, some capture backends initialize COM (apartment model) on the
+    /// calling thread. Doing that on the GUI thread can conflict with winit/eframe
+    /// which uses OLE/COM on the same thread.
+    fn new_lazy<S>(
+        make_source: impl FnOnce() -> anyhow::Result<S> + Send + 'static,
+        shutdown: CancellationToken,
+    ) -> Result<Self>
+    where
+        S: VideoSource,
+    {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let (init_tx, init_rx) =
+            std::sync::mpsc::sync_channel::<anyhow::Result<crate::av::VideoFormat>>(1);
+
+        std::thread::spawn({
+            let shutdown = shutdown.clone();
+            move || {
+                let mut source = match make_source() {
+                    Ok(source) => source,
+                    Err(err) => {
+                        let _ = init_tx.send(Err(err));
+                        return;
+                    }
+                };
+                let format = source.format();
+                let _ = init_tx.send(Ok(format));
+
+                loop {
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
+                    match source.pop_frame() {
+                        Ok(Some(frame)) => {
+                            let _ = tx.send(Some(frame));
+                        }
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+
+        let format = init_rx
+            .recv()
+            .context("video source init thread ended unexpectedly")?
+            .map_err(|err| anyhow!("video source init failed: {err:#}"))?;
+
+        Ok(Self {
+            format,
+            frames_rx: rx,
+        })
     }
 }
 

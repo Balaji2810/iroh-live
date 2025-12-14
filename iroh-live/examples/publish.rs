@@ -4,7 +4,6 @@ use iroh_live::{
     Live,
     audio::AudioBackend,
     av::{AudioPreset, VideoCodec, VideoPreset},
-    capture::CameraCapturer,
     capture::ScreenCapturer,
     ffmpeg::{H264Encoder, 
         OpusEncoder
@@ -21,9 +20,6 @@ async fn main() -> n0_error::Result {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
-    // Initialize camera FIRST, before audio backend
-    // This ensures MediaFoundation gets to set COM threading model
-    let _camera = CameraCapturer::new()?;
     let screen = ScreenCapturer::new()?;
 
     // Setup audio backend AFTER camera
@@ -63,7 +59,8 @@ async fn main() -> n0_error::Result {
         .map(|preset| VideoPresetWithFps::with_source_dimensions(*preset, cli.fps, source_width, source_height))
         .collect::<Vec<_>>();
 
-    let video = VideoRenditions::new_with_fps::<H264Encoder>(screen, presets_with_fps);
+    // Construct the screen capturer in the capture thread to avoid COM conflicts on Windows.
+    let video = VideoRenditions::new_with_fps_lazy::<H264Encoder, _>(|| Ok(screen), presets_with_fps)?;
     broadcast.set_video(Some(video))?;
 
     // Publish under the name "hello".

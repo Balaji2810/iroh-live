@@ -89,9 +89,17 @@ fn main() -> Result<()> {
 
     let _guard = rt.enter();
     let self_watch = broadcast.watch_local();
+    let mut native_options = eframe::NativeOptions::default();
+    // On Windows, winit's drag-and-drop support calls `OleInitialize` (STA) and can
+    // panic with `RPC_E_CHANGED_MODE` if something else initialized COM differently
+    // on the same thread. Disable it to avoid crashing.
+    #[cfg(target_os = "windows")]
+    {
+        native_options.viewport = native_options.viewport.with_drag_and_drop(false);
+    }
     eframe::run_native(
         "IrohLive",
-        eframe::NativeOptions::default(),
+        native_options,
         Box::new(|cc| {
             let app = App {
                 rt,
@@ -143,11 +151,9 @@ async fn setup(
             broadcast.set_audio(Some(audio))?;
         }
         let video = if cli.screen {
-            let screen = ScreenCapturer::new()?;
-            VideoRenditions::new::<H264Encoder>(screen, VideoPreset::all())
+            VideoRenditions::new_lazy::<H264Encoder, _>(ScreenCapturer::new, VideoPreset::all())?
         } else {
-            let camera = CameraCapturer::new()?;
-            VideoRenditions::new::<H264Encoder>(camera, VideoPreset::all())
+            VideoRenditions::new_lazy::<H264Encoder, _>(CameraCapturer::new, VideoPreset::all())?
         };
         broadcast.set_video(Some(video))?;
         broadcast
