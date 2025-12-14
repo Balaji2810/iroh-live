@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 anyhow = "1.0.100"
 bytemuck = "1.24.0"
 byte-unit = { version = "5.1", features = ["bit"] }
+cpal = "0.15"
 data-encoding = "2.9.0"
 derive_more = { version = "2.0.1", features = ["display", "debug"] }
 ffmpeg-next = { version = "8.0.0", features = ["device", "format"] }

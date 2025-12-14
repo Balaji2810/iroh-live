@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -7,8 +8,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use firewheel::{
-    CpalConfig, CpalInputConfig, CpalOutputConfig, FirewheelConfig, FirewheelContext,
+    CpalConfig, CpalOutputConfig, FirewheelConfig, FirewheelContext,
     channel_config::{ChannelCount, NonZeroChannelCount},
     graph::PortIdx,
     nodes::stream::{
@@ -127,6 +129,8 @@ pub struct MicrophoneSource {
 }
 
 impl MicrophoneSource {
+    // Kept for the Firewheel stream-reader path (currently not used by default).
+    #[allow(dead_code)]
     pub(crate) fn new(handle: InputStreamHandle, sample_rate: u32, channel_count: u32) -> Self {
         Self {
             handle,
@@ -134,6 +138,374 @@ impl MicrophoneSource {
                 sample_rate,
                 channel_count,
             },
+        }
+    }
+}
+
+/// Microphone input via CPAL, resampled to 48kHz stereo for the encoder pipeline.
+///
+/// This is intentionally separate from Firewheel's duplex stream so input/output devices
+/// can have different hardware sample rates.
+pub struct CpalMicrophoneSource {
+    /// Always 48kHz stereo.
+    format: AudioFormat,
+    /// Interleaved f32 samples at native rate/channels from the CPAL callback.
+    queue: Arc<Mutex<VecDeque<f32>>>,
+    /// Native device rate.
+    src_rate: u32,
+    /// Native device channels.
+    src_channels: usize,
+    /// Resampler position in source frames.
+    src_pos_frames: f32,
+    /// Stops the capture thread (and drops the CPAL stream on that thread).
+    stop: Arc<AtomicBool>,
+    /// Keep the capture thread alive.
+    capture_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CpalMicrophoneSource {
+    fn is_likely_loopback_device(name_lc: &str) -> bool {
+        // Windows/common virtual/loopback capture names. This is best-effort and intentionally conservative.
+        name_lc.contains("stereo mix")
+            || name_lc.contains("what u hear")
+            || name_lc.contains("loopback")
+            || name_lc.contains("voice meeter")
+            || name_lc.contains("voicemeeter")
+            || name_lc.contains("vb-audio")
+            || name_lc.contains("cable output")
+            || name_lc.contains("virtual audio")
+    }
+
+    fn select_input_device() -> anyhow::Result<cpal::Device> {
+        let host = cpal::default_host();
+
+        // Optional override: pick a device whose name contains this substring (case-insensitive).
+        let wanted = std::env::var("IROH_AUDIO_INPUT_DEVICE").ok().map(|s| s.to_lowercase());
+
+        let default = host.default_input_device();
+        if let Some(wanted) = wanted {
+            let mut devices = host.input_devices().context("failed to list input devices")?;
+            while let Some(dev) = devices.next() {
+                let name = dev.name().unwrap_or_default();
+                if name.to_lowercase().contains(&wanted) {
+                    tracing::info!("Using input device (from IROH_AUDIO_INPUT_DEVICE): {name}");
+                    return Ok(dev);
+                }
+            }
+            anyhow::bail!("no input device matched IROH_AUDIO_INPUT_DEVICE={wanted:?}");
+        }
+
+        // Prefer the default input if it doesn't look like loopback.
+        if let Some(dev) = default {
+            let name = dev.name().unwrap_or_default();
+            let name_lc = name.to_lowercase();
+            if !Self::is_likely_loopback_device(&name_lc) {
+                tracing::info!("Using default input device: {name}");
+                return Ok(dev);
+            }
+            tracing::warn!(
+                "Default input device looks like loopback ({name}); searching for a physical mic. \
+                 Set IROH_AUDIO_INPUT_DEVICE to override."
+            );
+        }
+
+        // Otherwise, pick the first non-loopback input device.
+        let mut devices = host.input_devices().context("failed to list input devices")?;
+        while let Some(dev) = devices.next() {
+            let name = dev.name().unwrap_or_default();
+            let name_lc = name.to_lowercase();
+            if Self::is_likely_loopback_device(&name_lc) {
+                continue;
+            }
+            tracing::info!("Using non-loopback input device: {name}");
+            return Ok(dev);
+        }
+
+        // Fallback: if we couldn't find anything else, try default anyway.
+        if let Some(dev) = cpal::default_host().default_input_device() {
+            let name = dev.name().unwrap_or_default();
+            tracing::warn!("Falling back to default input device: {name}");
+            return Ok(dev);
+        }
+
+        anyhow::bail!("no input devices available")
+    }
+
+    pub fn new_48k_stereo() -> anyhow::Result<Self> {
+        let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // We cannot store `cpal::Stream` inside this struct because `Stream` is not `Send`
+        // on all platforms (notably Windows). Instead we run CPAL capture on a dedicated
+        // thread and share samples through `queue`.
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<anyhow::Result<(u32, usize)>>();
+        let queue_thread = queue.clone();
+        let stop_thread = stop.clone();
+
+        let capture_thread = std::thread::spawn(move || {
+            let init: anyhow::Result<(u32, usize)> = (|| {
+                let device = CpalMicrophoneSource::select_input_device()?;
+                let default_cfg = device
+                    .default_input_config()
+                    .context("no default input config")?;
+
+                let src_rate = default_cfg.sample_rate().0;
+                let src_channels = default_cfg.channels() as usize;
+                if src_channels == 0 {
+                    anyhow::bail!("input device reports 0 channels");
+                }
+
+                // Bound buffer to ~2 seconds to avoid unbounded latency growth.
+                let max_samples = (src_rate as usize) * src_channels * 2;
+
+                let err_fn = |err| tracing::warn!("cpal input stream error: {err}");
+                let cfg: cpal::StreamConfig = default_cfg.clone().into();
+
+                let queue_for_callbacks = queue_thread.clone();
+                let stream = match default_cfg.sample_format() {
+                    cpal::SampleFormat::F32 => {
+                        let queue_cb = queue_for_callbacks.clone();
+                        device.build_input_stream(
+                            &cfg,
+                            move |data: &[f32], _| {
+                                let mut q = queue_cb.lock().unwrap_or_else(|e| e.into_inner());
+                                q.extend(data.iter().copied());
+                                while q.len() > max_samples {
+                                    q.pop_front();
+                                }
+                            },
+                            err_fn,
+                            None,
+                        )?
+                    }
+                    cpal::SampleFormat::I16 => {
+                        let queue_cb = queue_for_callbacks.clone();
+                        device.build_input_stream(
+                            &cfg,
+                            move |data: &[i16], _| {
+                                let mut q = queue_cb.lock().unwrap_or_else(|e| e.into_inner());
+                                q.extend(data.iter().map(|&x| x as f32 / i16::MAX as f32));
+                                while q.len() > max_samples {
+                                    q.pop_front();
+                                }
+                            },
+                            err_fn,
+                            None,
+                        )?
+                    }
+                    cpal::SampleFormat::U16 => {
+                        let queue_cb = queue_for_callbacks.clone();
+                        device.build_input_stream(
+                            &cfg,
+                            move |data: &[u16], _| {
+                                let mut q = queue_cb.lock().unwrap_or_else(|e| e.into_inner());
+                                q.extend(
+                                    data.iter().map(|&x| (x as f32 / u16::MAX as f32) * 2.0 - 1.0),
+                                );
+                                while q.len() > max_samples {
+                                    q.pop_front();
+                                }
+                            },
+                            err_fn,
+                            None,
+                        )?
+                    }
+                    other => anyhow::bail!("unsupported CPAL sample format: {other:?}"),
+                };
+
+                stream.play()?;
+
+                // Keep the stream alive on this thread by returning it to the outer scope.
+                Ok((src_rate, src_channels))
+            })();
+
+            let init_ok = init.is_ok();
+            let _ = init_tx.send(init);
+            if !init_ok {
+                return;
+            }
+
+            // Keep thread alive until stop is requested.
+            // IMPORTANT: CPAL stream must stay alive; (re)create it here and keep it in scope.
+            // We re-open the device/stream because the previous `stream` lived only inside the
+            // init closure scope.
+            let _stream = (|| -> anyhow::Result<cpal::Stream> {
+                let device = CpalMicrophoneSource::select_input_device()?;
+                let default_cfg = device
+                    .default_input_config()
+                    .context("no default input config")?;
+
+                let src_rate = default_cfg.sample_rate().0;
+                let src_channels = default_cfg.channels() as usize;
+                if src_channels == 0 {
+                    anyhow::bail!("input device reports 0 channels");
+                }
+                let max_samples = (src_rate as usize) * src_channels * 2;
+
+                let err_fn = |err| tracing::warn!("cpal input stream error: {err}");
+                let cfg: cpal::StreamConfig = default_cfg.clone().into();
+                let queue_for_callbacks = queue_thread.clone();
+
+                let stream = match default_cfg.sample_format() {
+                    cpal::SampleFormat::F32 => {
+                        let queue_cb = queue_for_callbacks.clone();
+                        device.build_input_stream(
+                            &cfg,
+                            move |data: &[f32], _| {
+                                let mut q =
+                                    queue_cb.lock().unwrap_or_else(|e| e.into_inner());
+                                q.extend(data.iter().copied());
+                                while q.len() > max_samples {
+                                    q.pop_front();
+                                }
+                            },
+                            err_fn,
+                            None,
+                        )?
+                    }
+                    cpal::SampleFormat::I16 => {
+                        let queue_cb = queue_for_callbacks.clone();
+                        device.build_input_stream(
+                            &cfg,
+                            move |data: &[i16], _| {
+                                let mut q =
+                                    queue_cb.lock().unwrap_or_else(|e| e.into_inner());
+                                q.extend(data.iter().map(|&x| x as f32 / i16::MAX as f32));
+                                while q.len() > max_samples {
+                                    q.pop_front();
+                                }
+                            },
+                            err_fn,
+                            None,
+                        )?
+                    }
+                    cpal::SampleFormat::U16 => {
+                        let queue_cb = queue_for_callbacks.clone();
+                        device.build_input_stream(
+                            &cfg,
+                            move |data: &[u16], _| {
+                                let mut q =
+                                    queue_cb.lock().unwrap_or_else(|e| e.into_inner());
+                                q.extend(data.iter().map(|&x| {
+                                    (x as f32 / u16::MAX as f32) * 2.0 - 1.0
+                                }));
+                                while q.len() > max_samples {
+                                    q.pop_front();
+                                }
+                            },
+                            err_fn,
+                            None,
+                        )?
+                    }
+                    other => anyhow::bail!("unsupported CPAL sample format: {other:?}"),
+                };
+                stream.play()?;
+                Ok(stream)
+            })()
+            .inspect_err(|err| tracing::error!("cpal mic capture failed: {err:#}"))
+            .ok();
+
+            while !stop_thread.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // stream dropped here when thread exits (if init succeeded)
+        });
+
+        let (src_rate, src_channels) = init_rx
+            .recv()
+            .context("cpal mic init channel closed")??;
+
+        Ok(Self {
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channel_count: 2,
+            },
+            src_rate,
+            src_channels,
+            queue,
+            src_pos_frames: 0.0,
+            stop,
+            capture_thread: Some(capture_thread),
+        })
+    }
+
+    #[inline]
+    fn read_src(q: &VecDeque<f32>, frame: usize, ch: usize, src_channels: usize) -> f32 {
+        q[frame * src_channels + ch]
+    }
+}
+
+impl AudioSource for CpalMicrophoneSource {
+    fn cloned_boxed(&self) -> Box<dyn AudioSource> {
+        // Create a fresh CPAL stream for each clone; simple and avoids sharing non-Sync handles.
+        Box::new(Self::new_48k_stereo().expect("failed to create CPAL microphone source"))
+    }
+
+    fn format(&self) -> AudioFormat {
+        self.format
+    }
+
+    fn pop_samples(&mut self, buf: &mut [f32]) -> anyhow::Result<Option<usize>> {
+        // Always output stereo interleaved.
+        let out_frames = buf.len() / 2;
+        buf.fill(0.0);
+
+        if out_frames == 0 {
+            return Ok(Some(0));
+        }
+
+        let ratio = self.src_rate as f32 / 48_000.0; // source frames per output frame
+        let src_ch = self.src_channels;
+
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let available_src_frames = q.len() / src_ch;
+        if available_src_frames < 2 {
+            // Keep pacing; output silence.
+            return Ok(Some(buf.len()));
+        }
+
+        let mut produced_frames = 0usize;
+        for i in 0..out_frames {
+            let idx0 = self.src_pos_frames.floor() as usize;
+            let frac = self.src_pos_frames - idx0 as f32;
+            let idx1 = idx0 + 1;
+
+            if idx1 >= available_src_frames {
+                break;
+            }
+
+            // Map source channels -> stereo (mono duplicated; >2 uses first two).
+            let l0 = Self::read_src(&q, idx0, 0.min(src_ch - 1), src_ch);
+            let l1 = Self::read_src(&q, idx1, 0.min(src_ch - 1), src_ch);
+            let rch = if src_ch >= 2 { 1 } else { 0 };
+            let r0 = Self::read_src(&q, idx0, rch, src_ch);
+            let r1 = Self::read_src(&q, idx1, rch, src_ch);
+
+            buf[i * 2] = l0 + frac * (l1 - l0);
+            buf[i * 2 + 1] = r0 + frac * (r1 - r0);
+
+            self.src_pos_frames += ratio;
+            produced_frames += 1;
+        }
+
+        // Drop whole source frames that have been consumed.
+        let drop_frames = self.src_pos_frames.floor() as usize;
+        let drop_samples = drop_frames.saturating_mul(src_ch).min(q.len());
+        for _ in 0..drop_samples {
+            q.pop_front();
+        }
+        self.src_pos_frames -= drop_frames as f32;
+
+        Ok(Some(produced_frames * 2))
+    }
+}
+
+impl Drop for CpalMicrophoneSource {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.capture_thread.take() {
+            // Best effort: don't panic on join failure.
+            let _ = handle.join();
         }
     }
 }
@@ -224,14 +596,10 @@ impl AudioDriver {
                 device_name: None,
                 ..Default::default()
             },
-            input: Some(CpalInputConfig {
-                #[cfg(target_os = "linux")]
-                device_name: Some("pipewire".to_string()),
-                #[cfg(not(target_os = "linux"))]
-                device_name: None,
-                fail_on_no_input: true,
-                ..Default::default()
-            }),
+            // NOTE: We intentionally start an output-only stream here to avoid the
+            // CPAL duplex requirement that input/output devices share one hardware sample rate.
+            // Microphone capture is handled separately via `CpalMicrophoneSource`.
+            input: None,
         };
         cx.start_stream(config).unwrap();
         info!(
@@ -456,11 +824,9 @@ impl AudioBackend {
 
     /// Convenience: produce a default microphone audio source (48kHz stereo).
     /// Uses a blocking call to initialize the input stream synchronously.
-    pub async fn default_microphone(&self) -> anyhow::Result<MicrophoneSource> {
-        const SAMPLE_RATE: u32 = 48_000;
-        const CHANNELS: u32 = 2;
-        let handle = self.input_stream(SAMPLE_RATE, CHANNELS).await?;
-        Ok(MicrophoneSource::new(handle, SAMPLE_RATE, CHANNELS))
+    pub async fn default_microphone(&self) -> anyhow::Result<Box<dyn AudioSource>> {
+        // Note: CPAL input stream creation is synchronous; keep async API for callers.
+        Ok(Box::new(CpalMicrophoneSource::new_48k_stereo()?))
     }
 
     pub async fn default_speaker(&self) -> anyhow::Result<OutputControl> {

@@ -16,6 +16,20 @@ pub trait AudioSource: Send + 'static {
     fn pop_samples(&mut self, buf: &mut [f32]) -> Result<Option<usize>>;
 }
 
+impl AudioSource for Box<dyn AudioSource> {
+    fn cloned_boxed(&self) -> Box<dyn AudioSource> {
+        (&**self).cloned_boxed()
+    }
+
+    fn format(&self) -> AudioFormat {
+        (&**self).format()
+    }
+
+    fn pop_samples(&mut self, buf: &mut [f32]) -> Result<Option<usize>> {
+        (&mut **self).pop_samples(buf)
+    }
+}
+
 pub trait AudioSink: Send + 'static {
     fn format(&self) -> Result<AudioFormat>;
     fn push_samples(&mut self, buf: &[f32]) -> Result<()>;
