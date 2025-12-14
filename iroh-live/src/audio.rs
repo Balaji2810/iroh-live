@@ -164,73 +164,6 @@ pub struct CpalMicrophoneSource {
 }
 
 impl CpalMicrophoneSource {
-    fn is_likely_loopback_device(name_lc: &str) -> bool {
-        // Windows/common virtual/loopback capture names. This is best-effort and intentionally conservative.
-        name_lc.contains("stereo mix")
-            || name_lc.contains("what u hear")
-            || name_lc.contains("loopback")
-            || name_lc.contains("voice meeter")
-            || name_lc.contains("voicemeeter")
-            || name_lc.contains("vb-audio")
-            || name_lc.contains("cable output")
-            || name_lc.contains("virtual audio")
-    }
-
-    fn select_input_device() -> anyhow::Result<cpal::Device> {
-        let host = cpal::default_host();
-
-        // Optional override: pick a device whose name contains this substring (case-insensitive).
-        let wanted = std::env::var("IROH_AUDIO_INPUT_DEVICE").ok().map(|s| s.to_lowercase());
-
-        let default = host.default_input_device();
-        if let Some(wanted) = wanted {
-            let mut devices = host.input_devices().context("failed to list input devices")?;
-            while let Some(dev) = devices.next() {
-                let name = dev.name().unwrap_or_default();
-                if name.to_lowercase().contains(&wanted) {
-                    tracing::info!("Using input device (from IROH_AUDIO_INPUT_DEVICE): {name}");
-                    return Ok(dev);
-                }
-            }
-            anyhow::bail!("no input device matched IROH_AUDIO_INPUT_DEVICE={wanted:?}");
-        }
-
-        // Prefer the default input if it doesn't look like loopback.
-        if let Some(dev) = default {
-            let name = dev.name().unwrap_or_default();
-            let name_lc = name.to_lowercase();
-            if !Self::is_likely_loopback_device(&name_lc) {
-                tracing::info!("Using default input device: {name}");
-                return Ok(dev);
-            }
-            tracing::warn!(
-                "Default input device looks like loopback ({name}); searching for a physical mic. \
-                 Set IROH_AUDIO_INPUT_DEVICE to override."
-            );
-        }
-
-        // Otherwise, pick the first non-loopback input device.
-        let mut devices = host.input_devices().context("failed to list input devices")?;
-        while let Some(dev) = devices.next() {
-            let name = dev.name().unwrap_or_default();
-            let name_lc = name.to_lowercase();
-            if Self::is_likely_loopback_device(&name_lc) {
-                continue;
-            }
-            tracing::info!("Using non-loopback input device: {name}");
-            return Ok(dev);
-        }
-
-        // Fallback: if we couldn't find anything else, try default anyway.
-        if let Some(dev) = cpal::default_host().default_input_device() {
-            let name = dev.name().unwrap_or_default();
-            tracing::warn!("Falling back to default input device: {name}");
-            return Ok(dev);
-        }
-
-        anyhow::bail!("no input devices available")
-    }
-
     pub fn new_48k_stereo() -> anyhow::Result<Self> {
         let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -244,7 +177,10 @@ impl CpalMicrophoneSource {
 
         let capture_thread = std::thread::spawn(move || {
             let init: anyhow::Result<(u32, usize)> = (|| {
-                let device = CpalMicrophoneSource::select_input_device()?;
+                let host = cpal::default_host();
+                let device = host
+                    .default_input_device()
+                    .context("no default input device")?;
                 let default_cfg = device
                     .default_input_config()
                     .context("no default input config")?;
@@ -330,7 +266,10 @@ impl CpalMicrophoneSource {
             // We re-open the device/stream because the previous `stream` lived only inside the
             // init closure scope.
             let _stream = (|| -> anyhow::Result<cpal::Stream> {
-                let device = CpalMicrophoneSource::select_input_device()?;
+                let host = cpal::default_host();
+                let device = host
+                    .default_input_device()
+                    .context("no default input device")?;
                 let default_cfg = device
                     .default_input_config()
                     .context("no default input config")?;
