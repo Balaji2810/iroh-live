@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use rubato::{Resampler, FftFixedOut};
 use firewheel::{
     CpalConfig, CpalOutputConfig, FirewheelConfig, FirewheelContext,
     channel_config::{ChannelCount, NonZeroChannelCount},
@@ -837,6 +838,14 @@ pub struct DecodedAudioSource {
     stop: Arc<AtomicBool>,
     /// Decoder thread handle
     _thread_handle: Option<std::thread::JoinHandle<()>>,
+    /// Rubato resampler for jitter buffering
+    resampler: FftFixedOut<f32>,
+    /// Intermediate buffer for resampler input
+    resampler_in: Vec<Vec<f32>>,
+    /// Intermediate buffer for resampler output
+    resampler_out: Vec<Vec<f32>>,
+    /// Ring buffer for storing resampled audio ready to be popped
+    output_queue: VecDeque<f32>,
 }
 
 impl DecodedAudioSource {
@@ -855,9 +864,20 @@ impl DecodedAudioSource {
         let queue_thread = queue.clone();
         let stop_thread = stop.clone();
         
+        // Initialize rubato resampler for jitter buffering
+        let resampler = FftFixedOut::<f32>::new(
+            target_format.sample_rate as usize,
+            target_format.sample_rate as usize,
+            1024, // output chunk size
+            2,    // sub-chunks (batching)
+            target_format.channel_count as usize,
+        )?;
+        let resampler_in = resampler.input_buffer_allocate(true);
+        let resampler_out = resampler.output_buffer_allocate(true);
+
         // Spawn async task to forward packets, then spawn thread to decode
-        // Low-latency: small channel buffer (3 packets = ~60ms at 20ms per packet)
-        let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel::<hang::Frame>(3);
+        // Buffer more packets to handle network bursts
+        let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel::<hang::Frame>(10);
         
         // Spawn tokio task to receive packets from the network
         let _task_handle = tokio::spawn(async move {
@@ -881,8 +901,8 @@ impl DecodedAudioSource {
         // Spawn thread to decode packets
         let thread_handle = std::thread::spawn(move || {
             let mut decoder = decoder;
-            // Low-latency: buffer ~200ms max (reduces latency while preventing underruns)
-            let max_samples = (target_format.sample_rate as usize) * (target_format.channel_count as usize) / 5;
+            // Buffer ~500ms max to allow jitter buffer to work
+            let max_samples = (target_format.sample_rate as usize) * (target_format.channel_count as usize) / 2;
             
             while !stop_thread.load(Ordering::Relaxed) {
                 // Try to receive a packet with timeout
@@ -922,6 +942,10 @@ impl DecodedAudioSource {
             queue,
             stop,
             _thread_handle: Some(thread_handle),
+            resampler,
+            resampler_in,
+            resampler_out,
+            output_queue: VecDeque::new(),
         })
     }
 }
@@ -939,18 +963,74 @@ impl AudioSource for DecodedAudioSource {
     fn pop_samples(&mut self, buf: &mut [f32]) -> anyhow::Result<Option<usize>> {
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         
-        let available = q.len();
-        if available == 0 {
-            // No samples available, output silence
-            buf.fill(0.0);
-            return Ok(Some(buf.len()));
+        // Jitter Buffer Logic:
+        // 1. Maintain a target buffer level (e.g. 60ms)
+        // 2. If buffer > target, speed up (ratio > 1.0)
+        // 3. If buffer < target, slow down (ratio < 1.0)
+        
+        let channels = self.format.channel_count as usize;
+        let target_level = 48000 * channels * 60 / 1000; // 60ms target
+        
+        // While we don't have enough output samples, try to process more input
+        while self.output_queue.len() < buf.len() {
+            let available_input = q.len();
+            
+            // If very low on input, just stop and output what we have (or silence)
+            // to avoid stalling for too long.
+            if available_input < 1024 * channels {
+                 break;
+            }
+
+            // Adjust ratio based on buffer depth
+            let ratio = if available_input > target_level * 2 {
+                1.01 // Speed up to drain buffer
+            } else if available_input < target_level / 2 {
+                0.99 // Slow down to accumulate buffer
+            } else {
+                1.0
+            };
+            
+            self.resampler.set_resample_ratio(ratio, true)?;
+            
+            let needed_frames = self.resampler.input_frames_next();
+            let needed_samples = needed_frames * channels;
+            
+            if available_input < needed_samples {
+                break;
+            }
+            
+            // Copy from queue to resampler input buffer
+            // De-interleave: [L, R, L, R] -> [[L, L], [R, R]]
+            for i in 0..needed_frames {
+                for c in 0..channels {
+                    let sample = q.pop_front().unwrap_or(0.0);
+                    self.resampler_in[c][i] = sample;
+                }
+            }
+            
+            // Process
+            let (_, out_len) = self.resampler.process_into_buffer(
+                &self.resampler_in, 
+                &mut self.resampler_out, 
+                None
+            )?;
+            
+            // Interleave back to output queue: [[L, L], [R, R]] -> [L, R, L, R]
+            for i in 0..out_len {
+                for c in 0..channels {
+                    self.output_queue.push_back(self.resampler_out[c][i]);
+                }
+            }
         }
         
-        let to_read = buf.len().min(available);
+        // Now fill the output buffer
+        let to_read = buf.len().min(self.output_queue.len());
         for i in 0..to_read {
-            buf[i] = q.pop_front().unwrap_or(0.0);
+            buf[i] = self.output_queue.pop_front().unwrap_or(0.0);
         }
-        // Zero-pad if we don't have enough samples
+        
+        // If we still don't have enough, pad with silence (underflow)
+        // Ideally we would do PLC here (repeat last sample or noise)
         for i in to_read..buf.len() {
             buf[i] = 0.0;
         }
