@@ -6,7 +6,7 @@ use n0_error::{AnyError, Result, StdResultExt, e, stack_error};
 use n0_future::task::{AbortOnDropHandle, JoinSet};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error_span, info, instrument};
+use tracing::{Instrument, debug, error_span, info, instrument, warn};
 use web_transport_iroh::Request;
 
 pub const ALPN: &[u8] = b"iroh-live/1";
@@ -301,7 +301,10 @@ impl Actor {
         // Note: We clone the subscribe consumer for each callback
         // If OriginConsumer doesn't implement Clone, we'll need to adjust this
         for tx in &self.session_callbacks {
-            let _ = tx.try_send((remote, subscribe_for_callback.clone()));
+            if let Err(_) = tx.try_send((remote, subscribe_for_callback.clone())) {
+                warn!("Failed to notify session callback - channel full. Consider increasing channel capacity.");
+                // Optionally use send().await instead, but this requires async context
+            }
         }
 
         let shutdown = self.shutdown_token.child_token();

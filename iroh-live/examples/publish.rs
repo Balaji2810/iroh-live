@@ -15,7 +15,7 @@ use iroh_live::{
 use moq_lite::{BroadcastConsumer, OriginConsumer};
 use n0_error::{StackResultExt, StdResultExt};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[tokio::main]
 async fn main() -> n0_error::Result {
@@ -126,11 +126,14 @@ async fn main() -> n0_error::Result {
         while let Some((watcher_id, subscribe)) = session_rx.recv().await {
             info!(watcher_id=%watcher_id.fmt_short(), "New watcher connected, checking for mic broadcast");
             
-            // Try to subscribe to watch-mic broadcast from this watcher
-            let watcher_mic_result = subscribe_to_watcher_mic(subscribe, WATCH_MIC_BROADCAST).await;
+            // Add timeout to prevent indefinite waiting
+            let watcher_mic_result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                subscribe_to_watcher_mic(subscribe, WATCH_MIC_BROADCAST)
+            ).await;
             
             match watcher_mic_result {
-                Ok(watcher_mic) => {
+                Ok(Ok(watcher_mic)) => {
                     info!(watcher_id=%watcher_id.fmt_short(), "Watcher mic audio detected and added");
                     
                     // Store in watcher manager (also adds to playback)
@@ -139,8 +142,11 @@ async fn main() -> n0_error::Result {
                     manager.add_watcher(watcher_id_str.clone());
                     manager.set_watcher_mic(&watcher_id_str, watcher_mic);
                 }
-                Err(err) => {
-                    debug!(watcher_id=%watcher_id.fmt_short(), ?err, "Watcher is not publishing mic audio (this is normal if they haven't set up mic yet)");
+                Ok(Err(err)) => {
+                    debug!(watcher_id=%watcher_id.fmt_short(), ?err, "Watcher is not publishing mic audio");
+                }
+                Err(_) => {
+                    warn!(watcher_id=%watcher_id.fmt_short(), "Timeout waiting for watcher mic broadcast");
                 }
             }
         }
