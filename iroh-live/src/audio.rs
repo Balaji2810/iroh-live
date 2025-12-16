@@ -1233,14 +1233,18 @@ impl WatcherManager {
     /// This also adds the mic to local playback so the publisher can hear them.
     pub fn set_watcher_mic(&mut self, watcher_id: &str, mic: Box<dyn AudioSource>) {
         // Add to local playback (publisher hears this watcher)
-        let mic_for_playback = mic.cloned_boxed();
-        if let Err(err) = self.playback_handle.add_source(mic_for_playback) {
+        // We must use the REAL mic source here because DecodedAudioSource cannot be cloned (clones are silent).
+        // For now, we clone the SILENT version for the pipeline (AEC placeholder).
+        // TODO: Implement SplitAudioSource to allow both playback and AEC.
+        let mic_for_pipeline = mic.cloned_boxed();
+        
+        if let Err(err) = self.playback_handle.add_source(mic) {
             warn!("WatcherManager: failed to add mic to playback: {err}");
         }
         
         // Store in pipeline for future AEC
         if let Some(pipeline) = self.watchers.get_mut(watcher_id) {
-            pipeline.set_watcher_mic(mic);
+            pipeline.set_watcher_mic(mic_for_pipeline);
             info!("WatcherManager: set mic for watcher {}", watcher_id);
         } else {
             warn!("WatcherManager: watcher {} not found for mic assignment", watcher_id);
