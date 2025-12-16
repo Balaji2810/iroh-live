@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
-use iroh::{Endpoint, SecretKey, protocol::Router};
+use iroh::{Endpoint, EndpointId, SecretKey, protocol::Router};
 use iroh_live::{
     ALPN, Live, LiveSession,
     audio::{AudioBackend, DecodedAudioSource, DynamicPlaybackMixer, MixedAudioSource, WatcherManager},
@@ -12,7 +12,10 @@ use iroh_live::{
     subscribe::SubscribeBroadcast,
     ticket::LiveTicket,
 };
+use moq_lite::{BroadcastConsumer, OriginConsumer};
 use n0_error::{StackResultExt, StdResultExt};
+use tokio::sync::mpsc;
+use tracing::{debug, info};
 
 #[tokio::main]
 async fn main() -> n0_error::Result {
@@ -109,6 +112,40 @@ async fn main() -> n0_error::Result {
     let ticket = LiveTicket::new(router.endpoint().id(), name);
     println!("publishing at {ticket}");
 
+    // =========================================================================
+    // Automatically detect and subscribe to watcher mic broadcasts
+    // =========================================================================
+    
+    const WATCH_MIC_BROADCAST: &str = "watch-mic";
+    let (session_tx, mut session_rx) = mpsc::channel::<(EndpointId, OriginConsumer)>(16);
+    live.register_session_callback(session_tx)
+        .map_err(|e| n0_error::anyerr!("Failed to register session callback: {e}"))?;
+    
+    let watcher_manager_clone = watcher_manager.clone();
+    tokio::spawn(async move {
+        while let Some((watcher_id, subscribe)) = session_rx.recv().await {
+            info!(watcher_id=%watcher_id.fmt_short(), "New watcher connected, checking for mic broadcast");
+            
+            // Try to subscribe to watch-mic broadcast from this watcher
+            let watcher_mic_result = subscribe_to_watcher_mic(subscribe, WATCH_MIC_BROADCAST).await;
+            
+            match watcher_mic_result {
+                Ok(watcher_mic) => {
+                    info!(watcher_id=%watcher_id.fmt_short(), "Watcher mic audio detected and added");
+                    
+                    // Store in watcher manager (also adds to playback)
+                    let mut manager = watcher_manager_clone.lock().unwrap();
+                    let watcher_id_str = watcher_id.fmt_short().to_string();
+                    manager.add_watcher(watcher_id_str.clone());
+                    manager.set_watcher_mic(&watcher_id_str, watcher_mic);
+                }
+                Err(err) => {
+                    debug!(watcher_id=%watcher_id.fmt_short(), ?err, "Watcher is not publishing mic audio (this is normal if they haven't set up mic yet)");
+                }
+            }
+        }
+    });
+
     // Wait for ctrl-c and then shutdown.
     tokio::signal::ctrl_c().await?;
     live.shutdown();
@@ -157,6 +194,67 @@ async fn build_base_audio(
     };
 
     Ok(audio)
+}
+
+/// Subscribe to a watcher's mic broadcast using an OriginConsumer.
+async fn subscribe_to_watcher_mic(
+    mut subscribe: OriginConsumer,
+    broadcast_name: &str,
+) -> n0_error::Result<Box<dyn AudioSource>> {
+    // Target format for all audio sources: 48kHz stereo
+    let target_format = AudioFormat {
+        sample_rate: 48_000,
+        channel_count: 2,
+    };
+
+    // Wait for the broadcast to be announced and subscribe to it
+    let broadcast_consumer = wait_for_broadcast(&mut subscribe, broadcast_name).await
+        .map_err(|e| n0_error::anyerr!("Failed to subscribe to watcher mic broadcast: {e}"))?;
+    
+    let subscribe_broadcast = SubscribeBroadcast::new(broadcast_consumer).await?;
+    
+    // Get audio config from the catalog
+    let audio_info = subscribe_broadcast.audio_info()
+        .context("watcher is not publishing audio")?;
+    let (rendition_name, audio_config) = audio_info.renditions.iter().next()
+        .context("no audio renditions available")?;
+    
+    info!("Subscribing to watcher audio: {rendition_name}");
+    
+    // Create a track consumer for the audio
+    let audio_track = subscribe_broadcast.subscribe_audio_track(rendition_name)?;
+    
+    // Create decoded audio source from watcher
+    let watcher_audio = DecodedAudioSource::new::<FfmpegAudioDecoder>(
+        audio_track,
+        audio_config,
+        target_format,
+    ).map_err(|e| n0_error::anyerr!("Failed to create decoded audio source: {e}"))?;
+
+    Ok(Box::new(watcher_audio))
+}
+
+/// Wait for a broadcast to be announced and return its consumer.
+async fn wait_for_broadcast(
+    subscribe: &mut OriginConsumer,
+    name: &str,
+) -> n0_error::Result<BroadcastConsumer> {
+    // Check if broadcast is already available
+    if let Some(consumer) = subscribe.consume_broadcast(name) {
+        return Ok(consumer);
+    }
+    
+    // Wait for announcement
+    loop {
+        let (path, consumer) = subscribe
+            .announced()
+            .await
+            .ok_or_else(|| n0_error::anyerr!("Broadcast not announced: {}", name))?;
+        debug!("Peer announced broadcast: {path}");
+        if path.as_str() == name {
+            return consumer.ok_or_else(|| n0_error::anyerr!("Broadcast was closed: {}", name));
+        }
+    }
 }
 
 /// Connect to a watcher and get their mic audio source.

@@ -90,6 +90,18 @@ impl Live {
     pub fn shutdown(&self) {
         self.shutdown_token.cancel();
     }
+
+    /// Register a callback to be notified when a new session is established.
+    /// The callback receives (EndpointId, OriginConsumer) pairs for each incoming session.
+    pub fn register_session_callback(
+        &self,
+        tx: mpsc::Sender<(EndpointId, OriginConsumer)>,
+    ) -> Result<()> {
+        self.tx
+            .blocking_send(ActorMessage::RegisterSessionCallback(tx))
+            .std_context("live actor died")?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -213,10 +225,13 @@ impl LiveSession {
 enum ActorMessage {
     HandleSession(LiveSession),
     PublishBroadcast(BroadcastName, BroadcastProducer),
+    RegisterSessionCallback(mpsc::Sender<(EndpointId, OriginConsumer)>),
 }
 
 struct SessionState {
     publish: OriginProducer,
+    #[allow(dead_code)] // Kept for potential future use
+    subscribe: Option<OriginConsumer>,
 }
 
 type BroadcastName = String;
@@ -227,6 +242,7 @@ struct Actor {
     broadcasts: HashMap<BroadcastName, BroadcastProducer>,
     sessions: HashMap<EndpointId, SessionState>,
     session_tasks: JoinSet<(EndpointId, Result<(), moq_lite::Error>)>,
+    session_callbacks: Vec<mpsc::Sender<(EndpointId, OriginConsumer)>>,
 }
 
 impl Actor {
@@ -254,6 +270,9 @@ impl Actor {
             ActorMessage::PublishBroadcast(name, producer) => {
                 self.handle_publish_broadcast(name, producer)
             }
+            ActorMessage::RegisterSessionCallback(tx) => {
+                self.session_callbacks.push(tx);
+            }
         }
     }
 
@@ -263,13 +282,26 @@ impl Actor {
             remote,
             moq_session,
             publish,
-            subscribe: _,
+            subscribe,
             ..
         } = session;
         for (name, producer) in self.broadcasts.iter() {
             publish.publish_broadcast(name.to_string(), producer.consume());
         }
-        self.sessions.insert(remote, SessionState { publish });
+        
+        // Store subscribe consumer
+        let subscribe_for_callback = subscribe.clone();
+        self.sessions.insert(remote, SessionState { 
+            publish,
+            subscribe: Some(subscribe),
+        });
+        
+        // Notify all registered callbacks about the new session
+        // Note: We clone the subscribe consumer for each callback
+        // If OriginConsumer doesn't implement Clone, we'll need to adjust this
+        for tx in &self.session_callbacks {
+            let _ = tx.try_send((remote, subscribe_for_callback.clone()));
+        }
 
         let shutdown = self.shutdown_token.child_token();
         self.session_tasks.spawn(async move {

@@ -61,7 +61,8 @@ fn main() -> Result<()> {
             let mut mic_broadcast = PublishBroadcast::new();
             let audio_renditions = AudioRenditions::new::<OpusEncoder>(mic, [AudioPreset::Hq]);
             mic_broadcast.set_audio(Some(audio_renditions))?;
-            live.publish(WATCH_MIC_BROADCAST, mic_broadcast.producer()).await?;
+            // Publish on the existing session so the publisher can subscribe to it
+            session.publish(WATCH_MIC_BROADCAST.to_string(), mic_broadcast.producer().consume());
             println!("publishing mic audio as '{}'", WATCH_MIC_BROADCAST);
 
             n0_error::Ok((endpoint, session, subscribe_broadcast, video, audio, mic_broadcast))
