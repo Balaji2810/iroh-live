@@ -868,7 +868,7 @@ impl DecodedAudioSource {
         let resampler = FftFixedOut::<f32>::new(
             target_format.sample_rate as usize,
             target_format.sample_rate as usize,
-            1024, // output chunk size
+            512, // output chunk size (reduced from 1024 for lower latency)
             2,    // sub-chunks (batching)
             target_format.channel_count as usize,
         )?;
@@ -1017,9 +1017,9 @@ impl AudioSource for DecodedAudioSource {
         while self.output_queue.len() < buf.len() {
             let available_input = q.len();
             
-            // Lower threshold: only need 256 samples per channel (512 total for stereo)
-            // instead of 1024 per channel. This allows audio to start playing sooner.
-            let min_samples = 256 * channels;
+            // Lower threshold: only need 128 samples per channel (256 total for stereo)
+            // This allows audio to start playing sooner and reduces latency
+            let min_samples = 128 * channels;
             
             if available_input < min_samples {
                 break; // Wait for more data
@@ -1068,7 +1068,8 @@ impl AudioSource for DecodedAudioSource {
         // If output_queue is empty but we have some samples in the input queue,
         // output them directly (bypass resampler) to avoid silence
         // This is a fallback when we don't have enough for the resampler
-        if to_read == 0 && q.len() >= channels {
+        // Require at least 64 frames to avoid choppy audio
+        if to_read == 0 && q.len() >= channels * 64 {
             let direct_samples = buf.len().min(q.len());
             tracing::trace!(
                 "DecodedAudioSource: using direct passthrough ({} samples from queue, bypassing resampler)",
@@ -1665,8 +1666,8 @@ impl AudioDriver {
                 sample_rate.try_into().unwrap(),
                 output_stream_sample_rate,
                 ResamplingChannelConfig {
-                    capacity_seconds: 0.1,    // 100ms capacity (minimal buffering here)
-                    latency_seconds: 0.02,    // 20ms latency (rely on DecodedAudioSource jitter buffer)
+                    capacity_seconds: 0.2,    // 200ms capacity (increased to prevent underflow)
+                    latency_seconds: 0.05,    // 50ms latency (increased to reduce dropouts)
                     ..Default::default()
                 },
             )
