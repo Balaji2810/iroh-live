@@ -1008,12 +1008,9 @@ impl AudioSource for DecodedAudioSource {
         }
         
         // Jitter Buffer Logic:
-        // 1. Maintain a target buffer level (e.g. 60ms)
-        // 2. If buffer > target, speed up (ratio > 1.0)
-        // 3. If buffer < target, slow down (ratio < 1.0)
-        
-        // Increase target to 80ms to handle video congestion better
-        let target_level = 48000 * channels * 80 / 1000; 
+        // Use the queue as a jitter buffer. The resampler uses a fixed 1.0 ratio
+        // (no dynamic adjustment since FftFixedOut doesn't support it).
+        // The queue naturally handles timing variations.
         
         // While we don't have enough output samples, try to process more input
         while self.output_queue.len() < buf.len() {
@@ -1027,17 +1024,8 @@ impl AudioSource for DecodedAudioSource {
                 break; // Wait for more data
             }
 
-            // Adjust ratio based on buffer depth
-            let ratio = if available_input > target_level * 2 {
-                1.01 // Speed up to drain buffer
-            } else if available_input < target_level / 2 {
-                0.99 // Slow down to accumulate buffer
-            } else {
-                1.0
-            };
-            
-            self.resampler.set_resample_ratio(ratio, true)?;
-            
+            // Get the number of frames needed for the resampler
+            // Note: FftFixedOut uses a fixed ratio (1.0), so we don't adjust it
             let needed_frames = self.resampler.input_frames_next();
             let needed_samples = needed_frames * channels;
             
@@ -1055,7 +1043,7 @@ impl AudioSource for DecodedAudioSource {
                 }
             }
             
-            // Process
+            // Process with fixed 1.0 ratio (no dynamic adjustment)
             let (_, out_len) = self.resampler.process_into_buffer(
                 &self.resampler_in, 
                 &mut self.resampler_out, 
