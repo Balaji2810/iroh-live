@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use ffmpeg_next::{self as ffmpeg, codec, format::Pixel, frame::Video as VideoFrame};
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     av,
@@ -104,8 +104,8 @@ impl H264Encoder {
         // Distribute total bandwidth proportionally based on pixel count
         let pixels = width * height;
         // Use a quality factor that scales with resolution
-        // This will automatically distribute bandwidth across quality levels
-        let quality_factor = 0.15; // bits per pixel per frame
+        // Reduced to 0.1 for better CPU performance (was 0.15)
+        let quality_factor = 0.1; // bits per pixel per frame
         let calculated_bitrate = (pixels as f32 * quality_factor * framerate as f32).round() as u64;
 
         // Cap at max_bitrate
@@ -129,10 +129,16 @@ impl H264Encoder {
         for backend in candidates {
             match Self::open_encoder(backend, &opts) {
                 Ok((encoder, rescaler, vaapi)) => {
-                    info!(
-                        "Using encoder backend: {} ({backend:?})",
-                        backend.codec_name()
-                    );
+                    if matches!(backend, HwBackend::Software) {
+                        warn!(
+                            "Using software encoder (CPU). GPU acceleration not available. Performance may be limited. Check GPU drivers and FFmpeg build."
+                        );
+                    } else {
+                        info!(
+                            "Using hardware encoder backend: {} ({backend:?})",
+                            backend.codec_name()
+                        );
+                    }
                     return Ok(Self {
                         encoder,
                         rescaler,
@@ -200,47 +206,67 @@ impl H264Encoder {
 
         // Setup encoder options
         let enc_opts = {
-            let mut opts = vec![
+            let mut opts_vec = vec![
                 // Disable annexB so that we get an avcC header in extradata
                 ("annexB", "0"),
             ];
+            
+            // Pre-calculate bufsize strings for backends that need them
+            let bufsize_sw = (opts.bitrate * 2).to_string();
+            let bufsize_hw = opts.bitrate.to_string();
+            
             match backend {
                 HwBackend::Software => {
-                    opts.extend_from_slice(&[
+                    // CPU fallback: optimized for efficiency
+                    opts_vec.extend_from_slice(&[
                         ("preset", "ultrafast"),
                         ("tune", "zerolatency"),
                         ("profile", "baseline"),
+                        ("threads", "auto"),  // Use all CPU cores
                     ]);
+                    // bufsize = 2x bitrate for software (as per example)
+                    opts_vec.push(("bufsize", bufsize_sw.as_str()));
                 }
                 HwBackend::Nvenc => {
-                    opts.extend_from_slice(&[
-                        ("preset", "p1"),
-                        ("tune", "ull"),
+                    // NVIDIA GPU: optimized for low latency
+                    opts_vec.extend_from_slice(&[
+                        ("preset", "p1"),          // Fastest preset
+                        ("tune", "ull"),           // Ultra low latency
                         ("zerolatency", "1"),
                         ("delay", "0"),
-                        ("rc", "cbr"),
-                        ("bf", "0"),
-                        ("lookahead", "0"),
+                        ("rc", "cbr"),             // Constant bitrate
+                        ("bf", "0"),               // No B-frames
+                        ("lookahead", "0"),        // No lookahead
                         ("spatial-aq", "0"),
                         ("temporal-aq", "0"),
-                        ("forced-idr", "1"),     // Force IDR frames
-                        ("no-scenecut", "1"),    // Disable scene detection
+                        ("forced-idr", "1"),       // Force IDR frames
+                        ("no-scenecut", "1"),      // Disable scene detection
                     ]);
+                    // bufsize = bitrate for CBR (as per example)
+                    opts_vec.push(("bufsize", bufsize_hw.as_str()));
                 }
                 HwBackend::Qsv => {
-                    opts.extend_from_slice(&[
+                    // Intel QuickSync: optimized for low latency
+                    opts_vec.extend_from_slice(&[
                         ("preset", "veryfast"),
                         ("low_power", "1"),
+                        ("async_depth", "1"),      // Low latency async depth
                     ]);
+                    // bufsize = bitrate for CBR (as per example)
+                    opts_vec.push(("bufsize", bufsize_hw.as_str()));
                 }
                 HwBackend::Amf => {
-                    opts.extend_from_slice(&[
+                    // AMD GPU: optimized for low latency
+                    opts_vec.extend_from_slice(&[
                         ("usage", "ultralowlatency"),
+                        ("rc", "cbr"),             // Constant bitrate
                     ]);
+                    // bufsize = bitrate for CBR (as per example)
+                    opts_vec.push(("bufsize", bufsize_hw.as_str()));
                 }
                 _ => {}
             }
-            ffmpeg::Dictionary::from_iter(opts.into_iter())
+            ffmpeg::Dictionary::from_iter(opts_vec.into_iter())
         };
         // Open encoder
         let encoder = ctx.encoder().video()?.open_as_with(codec, enc_opts)?;
