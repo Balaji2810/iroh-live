@@ -8,6 +8,10 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use ffmpeg_next::{self as ffmpeg, codec, format::Pixel, frame::Video as VideoFrame};
 use tracing::{debug, info, trace, warn};
+use windows::{
+    core::PCSTR,
+    Win32::UI::WindowsAndMessaging::{MessageBoxA, MB_ICONWARNING, MB_OK},
+};
 
 use crate::{
     av,
@@ -124,8 +128,10 @@ impl H264Encoder {
 
         let candidates = HwBackend::candidates();
 
-        // Try each backend
+        // Try each backend and collect errors
         let mut last_err: Option<anyhow::Error> = None;
+        let mut hw_errors: Vec<(String, String)> = Vec::new(); // (backend_name, error_message)
+        
         for backend in candidates {
             match Self::open_encoder(backend, &opts) {
                 Ok((encoder, rescaler, vaapi)) => {
@@ -133,6 +139,49 @@ impl H264Encoder {
                         warn!(
                             "Using software encoder (CPU). GPU acceleration not available. Performance may be limited. Check GPU drivers and FFmpeg build."
                         );
+                        
+                        // Show popup with collected GPU errors
+                        if !hw_errors.is_empty() {
+                            let mut error_lines = Vec::new();
+                            for (name, err) in &hw_errors {
+                                error_lines.push(format!("• {}: {}", name, err));
+                            }
+                            let error_summary = error_lines.join("\n");
+                            
+                            let message = format!(
+                                "GPU acceleration is not available. Falling back to CPU encoding.\n\n\
+                                Hardware encoder errors:\n{}\n\n\
+                                Performance may be limited. Please update your GPU drivers or check your FFmpeg build.",
+                                error_summary
+                            );
+                            
+                            // Show popup in a separate thread to avoid blocking
+                            // Truncate message if too long (MessageBox has ~1024 char limit)
+                            let mut msg = message.clone();
+                            if msg.len() > 1000 {
+                                msg.truncate(997);
+                                msg.push_str("...");
+                            }
+                            std::thread::spawn(move || {
+                                unsafe {
+                                    // Create null-terminated C strings (they stay alive for the MessageBox call)
+                                    let title = match CString::new("GPU Acceleration Unavailable") {
+                                        Ok(s) => s,
+                                        Err(_) => return, // Shouldn't happen
+                                    };
+                                    let text = match CString::new(msg) {
+                                        Ok(s) => s,
+                                        Err(_) => return, // Shouldn't happen
+                                    };
+                                    
+                                    let title_ptr = PCSTR::from_raw(title.as_ptr() as *const u8);
+                                    let text_ptr = PCSTR::from_raw(text.as_ptr() as *const u8);
+                                    
+                                    // MessageBoxA is synchronous, so title and text stay alive during the call
+                                    let _ = MessageBoxA(None, text_ptr, title_ptr, MB_OK | MB_ICONWARNING);
+                                }
+                            });
+                        }
                     } else {
                         info!(
                             "Using hardware encoder backend: {} ({backend:?})",
@@ -149,10 +198,16 @@ impl H264Encoder {
                     });
                 }
                 Err(e) => {
+                    let error_msg = format!("{:#}", e);
                     debug!(
-                        "Backend {backend:?} ({}) not available: {e:#}",
+                        "Backend {backend:?} ({}) not available: {error_msg}",
                         backend.codec_name()
                     );
+                    
+                    // Collect hardware backend errors (not software)
+                    if !matches!(backend, HwBackend::Software) {
+                        hw_errors.push((backend.codec_name().to_string(), error_msg));
+                    }
                     last_err = Some(e);
                 }
             }

@@ -38,6 +38,8 @@ tokio-util = "0.7.17"
 tracing = "0.1.41"
 xcap = "0.7.1"
 rubato = "0.16.2"
+rfd = "0.16.0"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 
 [dev-dependencies]
