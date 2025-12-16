@@ -1019,10 +1019,12 @@ impl AudioSource for DecodedAudioSource {
         while self.output_queue.len() < buf.len() {
             let available_input = q.len();
             
-            // If very low on input, just stop and output what we have (or silence)
-            // to avoid stalling for too long.
-            if available_input < 1024 * channels {
-                 break;
+            // Lower threshold: only need 256 samples per channel (512 total for stereo)
+            // instead of 1024 per channel. This allows audio to start playing sooner.
+            let min_samples = 256 * channels;
+            
+            if available_input < min_samples {
+                break; // Wait for more data
             }
 
             // Adjust ratio based on buffer depth
@@ -1039,6 +1041,7 @@ impl AudioSource for DecodedAudioSource {
             let needed_frames = self.resampler.input_frames_next();
             let needed_samples = needed_frames * channels;
             
+            // Only process if we have enough for a full resampler chunk
             if available_input < needed_samples {
                 break;
             }
@@ -1067,16 +1070,34 @@ impl AudioSource for DecodedAudioSource {
             }
         }
         
-        // Now fill the output buffer
+        // Now fill the output buffer from output_queue
         let to_read = buf.len().min(self.output_queue.len());
         for i in 0..to_read {
             buf[i] = self.output_queue.pop_front().unwrap_or(0.0);
         }
         
-        // If we still don't have enough, pad with silence (underflow)
-        // Ideally we would do PLC here (repeat last sample or noise)
-        for i in to_read..buf.len() {
-            buf[i] = 0.0;
+        // If output_queue is empty but we have some samples in the input queue,
+        // output them directly (bypass resampler) to avoid silence
+        // This is a fallback when we don't have enough for the resampler
+        if to_read == 0 && q.len() >= channels {
+            let direct_samples = buf.len().min(q.len());
+            tracing::trace!(
+                "DecodedAudioSource: using direct passthrough ({} samples from queue, bypassing resampler)",
+                direct_samples
+            );
+            for i in 0..direct_samples {
+                buf[i] = q.pop_front().unwrap_or(0.0);
+            }
+            // Fill rest with silence
+            for i in direct_samples..buf.len() {
+                buf[i] = 0.0;
+            }
+        } else {
+            // Pad with silence (underflow)
+            // Ideally we would do PLC here (repeat last sample or noise)
+            for i in to_read..buf.len() {
+                buf[i] = 0.0;
+            }
         }
         
         Ok(Some(buf.len()))
