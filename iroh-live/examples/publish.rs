@@ -250,15 +250,26 @@ async fn wait_for_broadcast(
         return Ok(consumer);
     }
     
-    // Wait for announcement
+    // Wait for announcement, but also periodically check consume_broadcast
+    // in case the broadcast was announced before we started waiting
     loop {
-        let (path, consumer) = subscribe
-            .announced()
-            .await
-            .ok_or_else(|| n0_error::anyerr!("Broadcast not announced: {}", name))?;
-        debug!("Peer announced broadcast: {path}");
-        if path.as_str() == name {
-            return consumer.ok_or_else(|| n0_error::anyerr!("Broadcast was closed: {}", name));
+        tokio::select! {
+            // Check if broadcast became available (might have been announced already)
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if let Some(consumer) = subscribe.consume_broadcast(name) {
+                    debug!("Found broadcast '{}' via consume_broadcast (was already announced)", name);
+                    return Ok(consumer);
+                }
+            }
+            // Wait for new announcement
+            result = subscribe.announced() => {
+                let (path, consumer) = result
+                    .ok_or_else(|| n0_error::anyerr!("Broadcast not announced: {}", name))?;
+                debug!("Peer announced broadcast: {path}");
+                if path.as_str() == name {
+                    return consumer.ok_or_else(|| n0_error::anyerr!("Broadcast was closed: {}", name));
+                }
+            }
         }
     }
 }
