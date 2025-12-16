@@ -969,7 +969,8 @@ impl AudioSource for DecodedAudioSource {
         // 3. If buffer < target, slow down (ratio < 1.0)
         
         let channels = self.format.channel_count as usize;
-        let target_level = 48000 * channels * 60 / 1000; // 60ms target
+        // Increase target to 80ms to handle video congestion better
+        let target_level = 48000 * channels * 80 / 1000; 
         
         // While we don't have enough output samples, try to process more input
         while self.output_queue.len() < buf.len() {
@@ -1587,8 +1588,8 @@ impl AudioDriver {
                 sample_rate.try_into().unwrap(),
                 output_stream_sample_rate,
                 ResamplingChannelConfig {
-                    capacity_seconds: 0.15,   // Allow up to 150ms buffer
-                    latency_seconds: 0.06,    // 60ms latency (compromise between jitter and delay)
+                    capacity_seconds: 0.1,    // 100ms capacity (minimal buffering here)
+                    latency_seconds: 0.02,    // 20ms latency (rely on DecodedAudioSource jitter buffer)
                     ..Default::default()
                 },
             )
