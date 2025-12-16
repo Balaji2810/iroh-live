@@ -1,8 +1,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use hang::{
-    Catalog, CatalogConsumer, TrackConsumer,
-    catalog::{AudioConfig, VideoConfig},
+    Timestamp, TrackConsumer,
+    catalog::{AudioConfig, Catalog, CatalogConsumer, VideoConfig},
 };
 use moq_lite::{BroadcastConsumer, Track};
 use n0_error::{Result, StackResultExt, StdResultExt};
@@ -17,26 +17,30 @@ use tracing::{Span, debug, error, info, info_span, trace, warn};
 
 use crate::{
     av::{
-        AudioDecoder, AudioSink, AudioSinkHandle, DecodeConfig, DecodedFrame, Quality,
-        VideoDecoder, VideoSource,
+        AudioDecoder, AudioSink, AudioSinkHandle, DecodeConfig, DecodedFrame, Decoders,
+        PlaybackConfig, Quality, VideoDecoder, VideoSource,
     },
     ffmpeg::util::Rescaler,
     util::spawn_thread,
 };
 
-#[derive(Clone)]
+#[derive(derive_more::Debug, Clone)]
 pub struct SubscribeBroadcast {
+    broadcast_name: String,
+    #[debug("BroadcastConsumer")]
     broadcast: BroadcastConsumer,
+    #[debug("CatalogConsumer")]
     catalog_consumer: CatalogConsumer,
     catalog: Catalog,
     shutdown: CancellationToken,
 }
 
 impl SubscribeBroadcast {
-    pub async fn new(broadcast: BroadcastConsumer) -> Result<Self> {
+    pub async fn new(broadcast_name: String, broadcast: BroadcastConsumer) -> Result<Self> {
         let catalog_track = broadcast.subscribe_track(&Catalog::default_track());
         let catalog_consumer = CatalogConsumer::new(catalog_track);
         let mut this = Self {
+            broadcast_name,
             broadcast,
             catalog: Catalog::default(),
             catalog_consumer,
@@ -44,6 +48,10 @@ impl SubscribeBroadcast {
         };
         this.update_catalog().await?;
         Ok(this)
+    }
+
+    pub fn broadcast_name(&self) -> &str {
+        &self.broadcast_name
     }
 
     pub async fn update_catalog(&mut self) -> Result<()> {
@@ -154,12 +162,20 @@ impl SubscribeBroadcast {
             .map(|(name, _config)| name.as_str())
     }
 
-    pub async fn closed(&self) {
-        self.broadcast.closed().await
+    pub fn closed(&self) -> impl Future<Output = ()> + 'static {
+        self.broadcast.closed()
     }
 
     pub fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+
+    pub fn watch_and_listen<D: Decoders>(
+        self,
+        audio_out: impl AudioSink,
+        config: PlaybackConfig,
+    ) -> Result<AvRemoteTrack> {
+        AvRemoteTrack::new::<D>(self, audio_out, config)
     }
 }
 
@@ -274,12 +290,16 @@ impl AudioTrack {
                         let remote_start = *remote_start.get_or_insert_with(|| packet.timestamp);
 
                         let loop_elapsed = tick.duration_since(loop_start);
-                        let remote_elapsed = packet.timestamp.saturating_sub(remote_start);
+                        let remote_elapsed: Duration = packet
+                            .timestamp
+                            .checked_sub(remote_start)
+                            .unwrap_or(Timestamp::ZERO)
+                            .into();
                         let diff_ms =
                             (loop_elapsed.as_secs_f32() - remote_elapsed.as_secs_f32()) * 1000.;
 
                         // TODO: Skip outdated packets?
-                        trace!(len = packet.payload.len(), ts=?packet.timestamp, ?loop_elapsed, ?remote_elapsed, ?diff_ms, "recv packet");
+                        trace!(len = packet.payload.num_bytes(), ts=?packet.timestamp, ?loop_elapsed, ?remote_elapsed, ?diff_ms, "recv packet");
                         if !sink.is_paused() {
                             decoder.push_packet(packet)?;
                             if let Some(samples) = decoder.pop_samples()? {
@@ -546,7 +566,7 @@ impl WatchTrack {
 
 async fn forward_frames(mut track: hang::TrackConsumer, sender: mpsc::Sender<hang::Frame>) {
     loop {
-        let frame = track.read().await;
+        let frame = track.read_frame().await;
         match frame {
             Ok(Some(frame)) => {
                 if sender.send(frame).await.is_err() {
@@ -559,5 +579,34 @@ async fn forward_frames(mut track: hang::TrackConsumer, sender: mpsc::Sender<han
                 break;
             }
         }
+    }
+}
+
+pub struct AvRemoteTrack {
+    pub broadcast: SubscribeBroadcast,
+    pub video: Option<WatchTrack>,
+    pub audio: Option<AudioTrack>,
+}
+
+impl AvRemoteTrack {
+    pub fn new<D: Decoders>(
+        broadcast: SubscribeBroadcast,
+        audio_out: impl AudioSink,
+        config: PlaybackConfig,
+    ) -> Result<Self> {
+        let audio = broadcast
+            .listen_with::<D::Audio>(config.quality, audio_out)
+            .inspect_err(|err| tracing::warn!("no audio track: {err}"))
+            .ok();
+        let video = broadcast
+            .watch_with::<D::Video>(&config.playback, config.quality)
+            .inspect_err(|err| tracing::warn!("no video track: {err}"))
+            .ok();
+        Ok(Self {
+            broadcast,
+            // session: None,
+            audio,
+            video,
+        })
     }
 }

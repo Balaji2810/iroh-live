@@ -5,15 +5,15 @@ use eframe::egui::{self, Color32, Id, Vec2};
 use iroh::{Endpoint, protocol::Router};
 use iroh_gossip::{Gossip, TopicId};
 use iroh_live::{
+    Live,
     audio::AudioBackend,
     av::{AudioPreset, VideoPreset},
     capture::{CameraCapturer, ScreenCapturer},
     ffmpeg::{FfmpegDecoders, FfmpegVideoDecoder, H264Encoder, OpusEncoder, ffmpeg_log_init},
-    live::{AvRemoteTrack, Live},
     moq::MoqSession,
     publish::{AudioRenditions, PublishBroadcast, VideoRenditions},
-    rooms::{Room, RoomTicket},
-    subscribe::{AudioTrack, SubscribeBroadcast, WatchTrack},
+    rooms::{Room, RoomEvent, RoomTicket},
+    subscribe::{AudioTrack, AvRemoteTrack, SubscribeBroadcast, WatchTrack},
     util::StatsSmoother,
 };
 use n0_error::{Result, StdResultExt, anyerr};
@@ -98,14 +98,13 @@ async fn setup(cli: Cli, audio_ctx: AudioBackend) -> Result<(Router, PublishBroa
         broadcast.set_video(Some(video))?;
         broadcast
     };
-    live.publish(BROADCAST_NAME, broadcast.producer()).await?;
-
     let ticket = match cli.join {
-        None => RoomTicket::new(topic_id_from_env()?, vec![], BROADCAST_NAME),
+        None => RoomTicket::new(topic_id_from_env()?, vec![]),
         Some(ticket) => ticket,
     };
 
     let room = Room::new(router.endpoint(), gossip, live, ticket).await?;
+    room.publish(BROADCAST_NAME, broadcast.producer()).await?;
 
     println!("room ticket: {}", room.ticket());
 
@@ -127,25 +126,41 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(30)); // min 30 fps
 
         // Remove closed peers.
-        self.peers.retain(|track| !track.closed());
+        self.peers.retain(|track| !track.is_closed());
 
-        // Add newly subscribes peers.
-        while let Ok(track) = self.room.try_recv() {
-            info!("adding new track");
-            let track = match self.rt.block_on(async {
-                track
-                    .start::<FfmpegDecoders>(&self.audio_ctx, Default::default())
-                    .await
-            }) {
-                Ok(track) => track,
-                Err(err) => {
-                    warn!("failed to add track: {err}");
-                    continue;
+        // Add newly subscribed peers.
+        while let Ok(event) = self.room.try_recv() {
+            match event {
+                RoomEvent::RemoteAnnounced { remote, broadcasts } => {
+                    info!(
+                        "peer announced: {} with broadcasts {broadcasts:?}",
+                        remote.fmt_short(),
+                    );
                 }
-            };
+                RoomEvent::RemoteConnected { session } => {
+                    info!("peer connected: {}", session.conn().remote_id().fmt_short());
+                }
+                RoomEvent::BroadcastSubscribed { session, broadcast } => {
+                    info!(
+                        "subscribing to {}:{}",
+                        session.remote_id(),
+                        broadcast.broadcast_name()
+                    );
+                    let track = match self.rt.block_on(async {
+                        let audio_out = self.audio_ctx.default_output().await?;
+                        broadcast.watch_and_listen::<FfmpegDecoders>(audio_out, Default::default())
+                    }) {
+                        Ok(track) => track,
+                        Err(err) => {
+                            warn!("failed to add track: {err}");
+                            continue;
+                        }
+                    };
 
-            self.peers
-                .push(RemoteTrackView::new(ctx, track, self.peers.len()));
+                    self.peers
+                        .push(RemoteTrackView::new(ctx, session, track, self.peers.len()));
+                }
+            }
         }
 
         egui::CentralPanel::default()
@@ -194,18 +209,18 @@ struct RemoteTrackView {
 }
 
 impl RemoteTrackView {
-    fn new(ctx: &egui::Context, track: AvRemoteTrack, id: usize) -> Self {
+    fn new(ctx: &egui::Context, session: MoqSession, track: AvRemoteTrack, id: usize) -> Self {
         Self {
             video: track.video.map(|video| VideoView::new(ctx, video, id)),
             stats: StatsSmoother::new(),
             broadcast: track.broadcast,
             id,
             _audio_track: track.audio,
-            session: track.session,
+            session,
         }
     }
 
-    fn closed(&self) -> bool {
+    fn is_closed(&self) -> bool {
         self.session.conn().close_reason().is_some()
     }
 
