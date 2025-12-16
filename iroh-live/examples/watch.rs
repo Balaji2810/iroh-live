@@ -58,12 +58,16 @@ fn main() -> Result<()> {
 
             // Set up microphone publishing (publisher will detect and subscribe to this)
             let mic = audio_ctx.default_microphone().await?;
+            println!("[WATCH] Microphone acquired, format: {:?}", mic.format());
             let mut mic_broadcast = PublishBroadcast::new();
             let audio_renditions = AudioRenditions::new::<OpusEncoder>(mic, [AudioPreset::Hq]);
             mic_broadcast.set_audio(Some(audio_renditions))?;
+            println!("[WATCH] Created audio renditions for mic broadcast");
             // Publish on the existing session so the publisher can subscribe to it
-            session.publish(WATCH_MIC_BROADCAST.to_string(), mic_broadcast.producer().consume());
-            println!("publishing mic audio as '{}'", WATCH_MIC_BROADCAST);
+            let broadcast_name = WATCH_MIC_BROADCAST.to_string();
+            session.publish(broadcast_name.clone(), mic_broadcast.producer().consume());
+            println!("[WATCH] Published mic audio broadcast as '{}' on session", broadcast_name);
+            tracing::info!("[WATCH] Mic broadcast '{}' published successfully", broadcast_name);
 
             n0_error::Ok((endpoint, session, subscribe_broadcast, video, audio, mic_broadcast))
         }
