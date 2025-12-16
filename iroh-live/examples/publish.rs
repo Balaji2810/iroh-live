@@ -118,7 +118,7 @@ async fn main() -> n0_error::Result {
     
     const WATCH_MIC_BROADCAST: &str = "watch-mic";
     let (session_tx, mut session_rx) = mpsc::channel::<(EndpointId, OriginConsumer)>(16);
-    live.register_session_callback(session_tx)
+    live.register_session_callback(session_tx).await
         .map_err(|e| n0_error::anyerr!("Failed to register session callback: {e}"))?;
     
     let watcher_manager_clone = watcher_manager.clone();

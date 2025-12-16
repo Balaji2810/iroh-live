@@ -93,12 +93,13 @@ impl Live {
 
     /// Register a callback to be notified when a new session is established.
     /// The callback receives (EndpointId, OriginConsumer) pairs for each incoming session.
-    pub fn register_session_callback(
+    pub async fn register_session_callback(
         &self,
         tx: mpsc::Sender<(EndpointId, OriginConsumer)>,
     ) -> Result<()> {
         self.tx
-            .blocking_send(ActorMessage::RegisterSessionCallback(tx))
+            .send(ActorMessage::RegisterSessionCallback(tx))
+            .await
             .std_context("live actor died")?;
         Ok(())
     }
