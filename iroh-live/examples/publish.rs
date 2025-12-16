@@ -1,19 +1,18 @@
+use std::sync::{Arc, Mutex};
+
 use clap::Parser;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_live::{
-    Live,
-    audio::AudioBackend,
-    av::{AudioPreset, VideoCodec, VideoPreset},
+    ALPN, Live, LiveSession,
+    audio::{AudioBackend, DecodedAudioSource, DynamicPlaybackMixer, MixedAudioSource, WatcherManager},
+    av::{AudioFormat, AudioPreset, AudioSource, VideoCodec, VideoPreset},
     capture::ScreenCapturer,
-    ffmpeg::{H264Encoder, 
-        OpusEncoder
-    },
-    publish::{
-        AudioRenditions, 
-        PublishBroadcast, VideoRenditions},
+    ffmpeg::{FfmpegAudioDecoder, H264Encoder, OpusEncoder},
+    publish::{AudioRenditions, PublishBroadcast, VideoRenditions},
+    subscribe::SubscribeBroadcast,
     ticket::LiveTicket,
 };
-use n0_error::StdResultExt;
+use n0_error::{StackResultExt, StdResultExt};
 
 #[tokio::main]
 async fn main() -> n0_error::Result {
@@ -32,16 +31,55 @@ async fn main() -> n0_error::Result {
         .await?;
     let live = Live::new(endpoint.clone());
     let router = Router::builder(endpoint)
-        .accept(iroh_live::ALPN, live.protocol_handler())
+        .accept(ALPN, live.protocol_handler())
         .spawn();
 
     // Create a publish broadcast.
     let mut broadcast = PublishBroadcast::new();
 
-    // Capture audio, and encode with the cli-provided preset.
-    let mic = audio_ctx.default_microphone().await?;
-    let audio = AudioRenditions::new::<OpusEncoder>(mic, [cli.audio_preset]);
+    // =========================================================================
+    // Set up per-watcher audio infrastructure
+    // =========================================================================
+    
+    // Create dynamic playback mixer for playing all watcher mics locally
+    let (playback_mixer, playback_handle) = DynamicPlaybackMixer::new();
+    
+    // Start playback thread - publisher hears all watcher mics
+    let speaker = audio_ctx.default_speaker().await
+        .map_err(|e| n0_error::anyerr!("Failed to get speaker: {e}"))?;
+    std::thread::spawn(move || {
+        println!("Started local playback for watcher mics");
+        playback_mixer.play_to(speaker);
+    });
+
+    // Build base audio source (system audio + publish mic)
+    let base_audio = build_base_audio(&cli, &audio_ctx).await?;
+    
+    // Create watcher manager with the base audio (cloned for each watcher)
+    let watcher_manager = Arc::new(Mutex::new(WatcherManager::new(
+        base_audio.cloned_boxed(),
+        playback_handle.clone(),
+    )));
+
+    // Use base audio for the main broadcast (watchers receive this)
+    let audio = AudioRenditions::new::<OpusEncoder>(base_audio, [cli.audio_preset]);
     broadcast.set_audio(Some(audio))?;
+
+    // =========================================================================
+    // Handle manual watcher connection (via --watch-ticket)
+    // Future: This will be replaced with automatic watcher detection
+    // =========================================================================
+    
+    if let Some(ticket_str) = &cli.watch_ticket {
+        let watcher_mic = connect_to_watcher(&live, ticket_str).await?;
+        println!("Watcher mic audio added to local playback");
+        
+        // Store in watcher manager for future AEC (also adds to playback)
+        let mut manager = watcher_manager.lock().unwrap();
+        let watcher_id = "manual-watcher".to_string();
+        manager.add_watcher(watcher_id.clone());
+        manager.set_watcher_mic(&watcher_id, watcher_mic);
+    }
 
     // Set max bitrate from CLI arg (in Mbps, converted to bits/sec)
     unsafe {
@@ -79,6 +117,91 @@ async fn main() -> n0_error::Result {
     Ok(())
 }
 
+/// Build the base audio source (system audio + publish mic).
+/// This is what gets sent to all watchers.
+async fn build_base_audio(
+    cli: &Cli,
+    audio_ctx: &AudioBackend,
+) -> n0_error::Result<Box<dyn AudioSource>> {
+    // Get publish mic
+    let mic = audio_ctx.default_microphone().await
+        .map_err(|e| n0_error::anyerr!("Failed to get microphone: {e}"))?;
+
+    // Try to capture system audio (Windows only)
+    let system_audio: Option<Box<dyn AudioSource>> = match audio_ctx.system_audio().await {
+        Ok(source) => {
+            println!("System audio capture enabled");
+            Some(source)
+        }
+        Err(err) => {
+            println!("System audio capture not available: {err}");
+            None
+        }
+    };
+
+    // Mix microphone with system audio (if available)
+    let audio: Box<dyn AudioSource> = match system_audio {
+        Some(sys_audio) => {
+            println!("Base audio: local mic + system audio (gain={})", cli.system_gain);
+            Box::new(MixedAudioSource::with_gains(
+                mic,
+                sys_audio,
+                1.0,
+                cli.system_gain,
+            ))
+        }
+        None => {
+            println!("Base audio: local mic only");
+            mic
+        }
+    };
+
+    Ok(audio)
+}
+
+/// Connect to a watcher and get their mic audio source.
+async fn connect_to_watcher(
+    live: &Live,
+    ticket_str: &str,
+) -> n0_error::Result<Box<dyn AudioSource>> {
+    // Target format for all audio sources: 48kHz stereo
+    let target_format = AudioFormat {
+        sample_rate: 48_000,
+        channel_count: 2,
+    };
+
+    let ticket = LiveTicket::deserialize(ticket_str)
+        .map_err(|e| n0_error::anyerr!("Failed to parse watch ticket: {e}"))?;
+    
+    println!("Connecting to watcher at {} ...", ticket.endpoint_id.fmt_short());
+    
+    let mut session: LiveSession = live.connect(ticket.endpoint_id).await?;
+    println!("Connected to watcher!");
+    
+    let consumer = session.subscribe(&ticket.broadcast_name).await?;
+    let subscribe_broadcast = SubscribeBroadcast::new(consumer).await?;
+    
+    // Get audio config from the catalog
+    let audio_info = subscribe_broadcast.audio_info()
+        .context("watcher is not publishing audio")?;
+    let (rendition_name, audio_config) = audio_info.renditions.iter().next()
+        .context("no audio renditions available")?;
+    
+    println!("Subscribing to watcher audio: {rendition_name}");
+    
+    // Create a track consumer for the audio
+    let audio_track = subscribe_broadcast.subscribe_audio_track(rendition_name)?;
+    
+    // Create decoded audio source from watcher
+    let watcher_audio = DecodedAudioSource::new::<FfmpegAudioDecoder>(
+        audio_track,
+        audio_config,
+        target_format,
+    ).map_err(|e| n0_error::anyerr!("Failed to create decoded audio source: {e}"))?;
+
+    Ok(Box::new(watcher_audio))
+}
+
 #[derive(Parser, Debug)]
 struct Cli {
     #[arg(long, default_value_t=VideoCodec::H264)]
@@ -91,6 +214,10 @@ struct Cli {
     fps: u32,
     #[arg(long, default_value_t=30, value_parser=clap::value_parser!(u32).range(5..=50), help="Maximum bandwidth in Mbps (5-50, default: 30)")]
     max_bandwidth: u32,
+    #[arg(long, help="Watcher ticket to subscribe to remote microphone audio (optional, for testing)")]
+    watch_ticket: Option<String>,
+    #[arg(long, default_value_t=0.5, help="Gain for system audio mixed with publish mic (0.0-1.0)")]
+    system_gain: f32,
 }
 
 fn secret_key_from_env() -> n0_error::Result<SecretKey> {

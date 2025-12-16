@@ -191,8 +191,8 @@ impl CpalMicrophoneSource {
                     anyhow::bail!("input device reports 0 channels");
                 }
 
-                // Bound buffer to ~2 seconds to avoid unbounded latency growth.
-                let max_samples = (src_rate as usize) * src_channels * 2;
+                // Low-latency: bound buffer to ~500ms to avoid unbounded latency growth.
+                let max_samples = (src_rate as usize) * src_channels / 2;
 
                 let err_fn = |err| tracing::warn!("cpal input stream error: {err}");
                 let cfg: cpal::StreamConfig = default_cfg.clone().into();
@@ -279,7 +279,7 @@ impl CpalMicrophoneSource {
                 if src_channels == 0 {
                     anyhow::bail!("input device reports 0 channels");
                 }
-                let max_samples = (src_rate as usize) * src_channels * 2;
+                let max_samples = (src_rate as usize) * src_channels / 2;
 
                 let err_fn = |err| tracing::warn!("cpal input stream error: {err}");
                 let cfg: cpal::StreamConfig = default_cfg.clone().into();
@@ -446,6 +446,832 @@ impl Drop for CpalMicrophoneSource {
             // Best effort: don't panic on join failure.
             let _ = handle.join();
         }
+    }
+}
+
+/// System audio capture via CPAL WASAPI loopback (Windows only).
+/// Captures the system audio output (what you hear from speakers) and makes it available
+/// as an AudioSource, resampled to 48kHz stereo.
+#[cfg(target_os = "windows")]
+pub struct CpalSystemAudioSource {
+    /// Always 48kHz stereo.
+    format: AudioFormat,
+    /// Interleaved f32 samples at native rate/channels from the CPAL callback.
+    queue: Arc<Mutex<VecDeque<f32>>>,
+    /// Native device rate.
+    src_rate: u32,
+    /// Native device channels.
+    src_channels: usize,
+    /// Resampler position in source frames.
+    src_pos_frames: f32,
+    /// Stops the capture thread.
+    stop: Arc<AtomicBool>,
+    /// Keep the capture thread alive.
+    capture_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "windows")]
+impl CpalSystemAudioSource {
+    /// Create a new system audio capture source at 48kHz stereo.
+    /// Uses WASAPI loopback to capture system audio output.
+    pub fn new_48k_stereo() -> anyhow::Result<Self> {
+        use cpal::traits::HostTrait;
+        
+        let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<anyhow::Result<(u32, usize)>>();
+        let queue_thread = queue.clone();
+        let stop_thread = stop.clone();
+
+        let capture_thread = std::thread::spawn(move || {
+            let init: anyhow::Result<(u32, usize)> = (|| {
+                // Use WASAPI host for loopback support
+                let host = cpal::host_from_id(cpal::HostId::Wasapi)
+                    .context("WASAPI host not available")?;
+                
+                // Get the default output device for loopback capture
+                let device = host
+                    .default_output_device()
+                    .context("no default output device for loopback")?;
+                
+                let default_cfg = device
+                    .default_output_config()
+                    .context("no default output config")?;
+
+                let src_rate = default_cfg.sample_rate().0;
+                let src_channels = default_cfg.channels() as usize;
+                if src_channels == 0 {
+                    anyhow::bail!("output device reports 0 channels");
+                }
+
+                Ok((src_rate, src_channels))
+            })();
+
+            let init_ok = init.is_ok();
+            let _ = init_tx.send(init);
+            if !init_ok {
+                return;
+            }
+
+            // Build and keep the loopback stream alive
+            let _stream = (|| -> anyhow::Result<cpal::Stream> {
+                let host = cpal::host_from_id(cpal::HostId::Wasapi)
+                    .context("WASAPI host not available")?;
+                let device = host
+                    .default_output_device()
+                    .context("no default output device for loopback")?;
+                let default_cfg = device
+                    .default_output_config()
+                    .context("no default output config")?;
+
+                let src_rate = default_cfg.sample_rate().0;
+                let src_channels = default_cfg.channels() as usize;
+                // Low-latency: ~500ms buffer
+                let max_samples = (src_rate as usize) * src_channels / 2;
+
+                let err_fn = |err| tracing::warn!("cpal system audio stream error: {err}");
+                
+                // Build a loopback input stream from the output device
+                // WASAPI allows capturing from output devices in loopback mode
+                let cfg = cpal::StreamConfig {
+                    channels: default_cfg.channels(),
+                    sample_rate: default_cfg.sample_rate(),
+                    buffer_size: cpal::BufferSize::Default,
+                };
+
+                let queue_for_callbacks = queue_thread.clone();
+                let stream = match default_cfg.sample_format() {
+                    cpal::SampleFormat::F32 => {
+                        let queue_cb = queue_for_callbacks.clone();
+                        device.build_input_stream(
+                            &cfg,
+                            move |data: &[f32], _| {
+                                let mut q = queue_cb.lock().unwrap_or_else(|e| e.into_inner());
+                                q.extend(data.iter().copied());
+                                while q.len() > max_samples {
+                                    q.pop_front();
+                                }
+                            },
+                            err_fn,
+                            None,
+                        )?
+                    }
+                    cpal::SampleFormat::I16 => {
+                        let queue_cb = queue_for_callbacks.clone();
+                        device.build_input_stream(
+                            &cfg,
+                            move |data: &[i16], _| {
+                                let mut q = queue_cb.lock().unwrap_or_else(|e| e.into_inner());
+                                q.extend(data.iter().map(|&x| x as f32 / i16::MAX as f32));
+                                while q.len() > max_samples {
+                                    q.pop_front();
+                                }
+                            },
+                            err_fn,
+                            None,
+                        )?
+                    }
+                    cpal::SampleFormat::U16 => {
+                        let queue_cb = queue_for_callbacks.clone();
+                        device.build_input_stream(
+                            &cfg,
+                            move |data: &[u16], _| {
+                                let mut q = queue_cb.lock().unwrap_or_else(|e| e.into_inner());
+                                q.extend(data.iter().map(|&x| (x as f32 / u16::MAX as f32) * 2.0 - 1.0));
+                                while q.len() > max_samples {
+                                    q.pop_front();
+                                }
+                            },
+                            err_fn,
+                            None,
+                        )?
+                    }
+                    other => anyhow::bail!("unsupported CPAL sample format: {other:?}"),
+                };
+                stream.play()?;
+                Ok(stream)
+            })()
+            .inspect_err(|err| tracing::error!("cpal system audio capture failed: {err:#}"))
+            .ok();
+
+            while !stop_thread.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        let (src_rate, src_channels) = init_rx
+            .recv()
+            .context("system audio init channel closed")??;
+
+        Ok(Self {
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channel_count: 2,
+            },
+            src_rate,
+            src_channels,
+            queue,
+            src_pos_frames: 0.0,
+            stop,
+            capture_thread: Some(capture_thread),
+        })
+    }
+
+    #[inline]
+    fn read_src(q: &VecDeque<f32>, frame: usize, ch: usize, src_channels: usize) -> f32 {
+        q[frame * src_channels + ch]
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl AudioSource for CpalSystemAudioSource {
+    fn cloned_boxed(&self) -> Box<dyn AudioSource> {
+        Box::new(Self::new_48k_stereo().expect("failed to create system audio source"))
+    }
+
+    fn format(&self) -> AudioFormat {
+        self.format
+    }
+
+    fn pop_samples(&mut self, buf: &mut [f32]) -> anyhow::Result<Option<usize>> {
+        // Same resampling logic as CpalMicrophoneSource
+        let out_frames = buf.len() / 2;
+        buf.fill(0.0);
+
+        if out_frames == 0 {
+            return Ok(Some(0));
+        }
+
+        let ratio = self.src_rate as f32 / 48_000.0;
+        let src_ch = self.src_channels;
+
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let available_src_frames = q.len() / src_ch;
+        if available_src_frames < 2 {
+            return Ok(Some(buf.len()));
+        }
+
+        let mut produced_frames = 0usize;
+        for i in 0..out_frames {
+            let idx0 = self.src_pos_frames.floor() as usize;
+            let frac = self.src_pos_frames - idx0 as f32;
+            let idx1 = idx0 + 1;
+
+            if idx1 >= available_src_frames {
+                break;
+            }
+
+            let l0 = Self::read_src(&q, idx0, 0.min(src_ch - 1), src_ch);
+            let l1 = Self::read_src(&q, idx1, 0.min(src_ch - 1), src_ch);
+            let rch = if src_ch >= 2 { 1 } else { 0 };
+            let r0 = Self::read_src(&q, idx0, rch, src_ch);
+            let r1 = Self::read_src(&q, idx1, rch, src_ch);
+
+            buf[i * 2] = l0 + frac * (l1 - l0);
+            buf[i * 2 + 1] = r0 + frac * (r1 - r0);
+
+            self.src_pos_frames += ratio;
+            produced_frames += 1;
+        }
+
+        let drop_frames = self.src_pos_frames.floor() as usize;
+        let drop_samples = drop_frames.saturating_mul(src_ch).min(q.len());
+        for _ in 0..drop_samples {
+            q.pop_front();
+        }
+        self.src_pos_frames -= drop_frames as f32;
+
+        Ok(Some(produced_frames * 2))
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for CpalSystemAudioSource {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.capture_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// An audio source that mixes two audio sources together.
+/// Both sources should be at the same sample rate and channel count (48kHz stereo).
+/// Samples are added together and clamped to prevent clipping.
+pub struct MixedAudioSource {
+    source1: Box<dyn AudioSource>,
+    source2: Box<dyn AudioSource>,
+    format: AudioFormat,
+    /// Temporary buffer for source2 samples
+    buf2: Vec<f32>,
+    /// Gain for source1 (0.0 to 1.0)
+    gain1: f32,
+    /// Gain for source2 (0.0 to 1.0)
+    gain2: f32,
+}
+
+impl MixedAudioSource {
+    /// Create a new mixed audio source from two sources.
+    /// Both sources should output 48kHz stereo audio.
+    pub fn new(source1: Box<dyn AudioSource>, source2: Box<dyn AudioSource>) -> Self {
+        Self::with_gains(source1, source2, 1.0, 1.0)
+    }
+
+    /// Create a new mixed audio source with custom gain for each source.
+    /// Gain values are typically between 0.0 and 1.0.
+    pub fn with_gains(
+        source1: Box<dyn AudioSource>,
+        source2: Box<dyn AudioSource>,
+        gain1: f32,
+        gain2: f32,
+    ) -> Self {
+        // Use source1's format (both should be the same)
+        let format = source1.format();
+        Self {
+            source1,
+            source2,
+            format,
+            buf2: Vec::new(),
+            gain1,
+            gain2,
+        }
+    }
+
+    /// Set the gain for source1.
+    #[allow(dead_code)]
+    pub fn set_gain1(&mut self, gain: f32) {
+        self.gain1 = gain;
+    }
+
+    /// Set the gain for source2.
+    #[allow(dead_code)]
+    pub fn set_gain2(&mut self, gain: f32) {
+        self.gain2 = gain;
+    }
+}
+
+impl AudioSource for MixedAudioSource {
+    fn cloned_boxed(&self) -> Box<dyn AudioSource> {
+        Box::new(Self {
+            source1: self.source1.cloned_boxed(),
+            source2: self.source2.cloned_boxed(),
+            format: self.format,
+            buf2: Vec::new(),
+            gain1: self.gain1,
+            gain2: self.gain2,
+        })
+    }
+
+    fn format(&self) -> AudioFormat {
+        self.format
+    }
+
+    fn pop_samples(&mut self, buf: &mut [f32]) -> anyhow::Result<Option<usize>> {
+        // Ensure buf2 is the right size
+        if self.buf2.len() != buf.len() {
+            self.buf2.resize(buf.len(), 0.0);
+        }
+
+        // Read from source1 into buf
+        let result1 = self.source1.pop_samples(buf)?;
+
+        // Read from source2 into buf2
+        let result2 = self.source2.pop_samples(&mut self.buf2)?;
+
+        // Mix the samples
+        match (result1, result2) {
+            (Some(n1), Some(n2)) => {
+                let samples_to_mix = n1.min(n2).min(buf.len());
+                for i in 0..samples_to_mix {
+                    // Apply gains and mix
+                    let mixed = buf[i] * self.gain1 + self.buf2[i] * self.gain2;
+                    // Soft clamp to prevent harsh clipping
+                    buf[i] = soft_clip(mixed);
+                }
+                // Zero out any remaining samples if source2 produced fewer
+                for i in samples_to_mix..n1 {
+                    buf[i] *= self.gain1;
+                }
+                Ok(Some(n1))
+            }
+            (Some(n), None) => {
+                // Only source1 produced samples, apply gain
+                for i in 0..n {
+                    buf[i] *= self.gain1;
+                }
+                Ok(Some(n))
+            }
+            (None, Some(n)) => {
+                // Only source2 produced samples, copy to buf with gain
+                for i in 0..n {
+                    buf[i] = self.buf2[i] * self.gain2;
+                }
+                Ok(Some(n))
+            }
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+/// Soft clipping function to prevent harsh distortion when mixing.
+/// Uses tanh-like curve for values outside [-1, 1].
+#[inline]
+fn soft_clip(x: f32) -> f32 {
+    if x > 1.0 {
+        1.0 - (-((x - 1.0) * 2.0)).exp() * 0.5
+    } else if x < -1.0 {
+        -1.0 + (-((-x - 1.0) * 2.0)).exp() * 0.5
+    } else {
+        x
+    }
+}
+
+/// An AudioSource that receives decoded audio samples from a network stream.
+/// Used to make remote audio available as an AudioSource for mixing.
+pub struct DecodedAudioSource {
+    format: AudioFormat,
+    /// Queue of decoded samples
+    queue: Arc<Mutex<VecDeque<f32>>>,
+    /// Signals to stop the decoder thread
+    stop: Arc<AtomicBool>,
+    /// Decoder thread handle
+    _thread_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DecodedAudioSource {
+    /// Create a new DecodedAudioSource from a track consumer and audio config.
+    /// Spawns a decoder thread that receives and decodes audio packets.
+    pub fn new<D: crate::av::AudioDecoder>(
+        consumer: hang::TrackConsumer,
+        config: &hang::catalog::AudioConfig,
+        target_format: AudioFormat,
+    ) -> anyhow::Result<Self> {
+        let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        
+        let decoder = D::new(config, target_format)?;
+        
+        let queue_thread = queue.clone();
+        let stop_thread = stop.clone();
+        
+        // Spawn async task to forward packets, then spawn thread to decode
+        // Low-latency: small channel buffer (3 packets = ~60ms at 20ms per packet)
+        let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel::<hang::Frame>(3);
+        
+        // Spawn tokio task to receive packets from the network
+        let _task_handle = tokio::spawn(async move {
+            let mut consumer = consumer;
+            loop {
+                match consumer.read().await {
+                    Ok(Some(frame)) => {
+                        if packet_tx.send(frame).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        tracing::warn!("decoded audio source: failed to read frame: {err:?}");
+                        break;
+                    }
+                }
+            }
+        });
+        
+        // Spawn thread to decode packets
+        let thread_handle = std::thread::spawn(move || {
+            let mut decoder = decoder;
+            // Low-latency: buffer ~200ms max (reduces latency while preventing underruns)
+            let max_samples = (target_format.sample_rate as usize) * (target_format.channel_count as usize) / 5;
+            
+            while !stop_thread.load(Ordering::Relaxed) {
+                // Try to receive a packet with timeout
+                match packet_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(packet) => {
+                        if let Err(err) = decoder.push_packet(packet) {
+                            tracing::warn!("decoded audio push_packet error: {err}");
+                            continue;
+                        }
+                        match decoder.pop_samples() {
+                            Ok(Some(samples)) => {
+                                let mut q = queue_thread.lock().unwrap_or_else(|e| e.into_inner());
+                                q.extend(samples.iter().copied());
+                                // Trim to max buffer size
+                                while q.len() > max_samples {
+                                    q.pop_front();
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                tracing::warn!("decoded audio pop_samples error: {err}");
+                            }
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Keep looping
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break;
+                    }
+                }
+            }
+        });
+        
+        Ok(Self {
+            format: target_format,
+            queue,
+            stop,
+            _thread_handle: Some(thread_handle),
+        })
+    }
+}
+
+impl AudioSource for DecodedAudioSource {
+    fn cloned_boxed(&self) -> Box<dyn AudioSource> {
+        // Cannot truly clone a network stream, return a silent source
+        Box::new(SilentAudioSource { format: self.format })
+    }
+
+    fn format(&self) -> AudioFormat {
+        self.format
+    }
+
+    fn pop_samples(&mut self, buf: &mut [f32]) -> anyhow::Result<Option<usize>> {
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        
+        let available = q.len();
+        if available == 0 {
+            // No samples available, output silence
+            buf.fill(0.0);
+            return Ok(Some(buf.len()));
+        }
+        
+        let to_read = buf.len().min(available);
+        for i in 0..to_read {
+            buf[i] = q.pop_front().unwrap_or(0.0);
+        }
+        // Zero-pad if we don't have enough samples
+        for i in to_read..buf.len() {
+            buf[i] = 0.0;
+        }
+        
+        Ok(Some(buf.len()))
+    }
+}
+
+impl Drop for DecodedAudioSource {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Thread will exit on its own due to stop flag
+    }
+}
+
+/// A silent audio source used as a fallback when cloning isn't possible.
+struct SilentAudioSource {
+    format: AudioFormat,
+}
+
+impl AudioSource for SilentAudioSource {
+    fn cloned_boxed(&self) -> Box<dyn AudioSource> {
+        Box::new(SilentAudioSource { format: self.format })
+    }
+
+    fn format(&self) -> AudioFormat {
+        self.format
+    }
+
+    fn pop_samples(&mut self, buf: &mut [f32]) -> anyhow::Result<Option<usize>> {
+        buf.fill(0.0);
+        Ok(Some(buf.len()))
+    }
+}
+
+// ============================================================================
+// Per-Watcher Audio Pipeline (for future AEC support)
+// ============================================================================
+
+/// Per-watcher audio pipeline with slot for future AEC.
+/// Each watcher has their own pipeline so we can apply individual echo cancellation.
+pub struct WatcherAudioPipeline {
+    /// Unique identifier for this watcher
+    pub watcher_id: String,
+    /// This watcher's mic audio (received from them) - stored for future AEC
+    pub watcher_mic: Option<Box<dyn AudioSource>>,
+    /// Base audio to send (system + publish mic)
+    base_audio: Box<dyn AudioSource>,
+    /// Output format
+    format: AudioFormat,
+    // Future: AEC processor using watcher_mic as reference
+    // aec: Option<AecProcessor>,
+}
+
+impl WatcherAudioPipeline {
+    /// Create a new pipeline for a watcher
+    pub fn new(watcher_id: String, base_audio: Box<dyn AudioSource>) -> Self {
+        let format = base_audio.format();
+        Self {
+            watcher_id,
+            watcher_mic: None,
+            base_audio,
+            format,
+        }
+    }
+
+    /// Set this watcher's mic audio (for future AEC)
+    pub fn set_watcher_mic(&mut self, mic: Box<dyn AudioSource>) {
+        self.watcher_mic = Some(mic);
+    }
+
+    /// Get the watcher ID
+    pub fn id(&self) -> &str {
+        &self.watcher_id
+    }
+}
+
+impl AudioSource for WatcherAudioPipeline {
+    fn cloned_boxed(&self) -> Box<dyn AudioSource> {
+        // Clone the base audio for the new pipeline
+        Box::new(Self {
+            watcher_id: self.watcher_id.clone(),
+            watcher_mic: None, // Can't clone network source
+            base_audio: self.base_audio.cloned_boxed(),
+            format: self.format,
+        })
+    }
+
+    fn format(&self) -> AudioFormat {
+        self.format
+    }
+
+    fn pop_samples(&mut self, buf: &mut [f32]) -> anyhow::Result<Option<usize>> {
+        // Future: Apply AEC here using watcher_mic as reference
+        // For now, just pass through the base audio
+        // 
+        // When AEC is implemented:
+        // if let Some(ref mut mic) = self.watcher_mic {
+        //     // Read mic samples for AEC reference
+        //     // Apply AEC to remove echo from base_audio
+        // }
+        
+        self.base_audio.pop_samples(buf)
+    }
+}
+
+// ============================================================================
+// Dynamic Playback Mixer (for playing all watcher mics on publisher speakers)
+// ============================================================================
+
+/// Mixes audio from dynamically added sources for local playback.
+/// Used to play all watcher mic audio on publisher's speakers.
+/// New sources can be added at runtime via a channel.
+pub struct DynamicPlaybackMixer {
+    /// Active audio sources being mixed
+    sources: Vec<Box<dyn AudioSource>>,
+    /// Channel to receive new sources
+    add_rx: std::sync::mpsc::Receiver<Box<dyn AudioSource>>,
+    /// Output format (48kHz stereo)
+    format: AudioFormat,
+    /// Temporary buffer for mixing
+    mix_buf: Vec<f32>,
+}
+
+/// Handle to add new audio sources to the DynamicPlaybackMixer
+pub struct DynamicPlaybackHandle {
+    add_tx: std::sync::mpsc::SyncSender<Box<dyn AudioSource>>,
+}
+
+impl DynamicPlaybackHandle {
+    /// Add a new audio source to be mixed and played
+    pub fn add_source(&self, source: Box<dyn AudioSource>) -> Result<()> {
+        self.add_tx.try_send(source)
+            .map_err(|_| anyhow::anyhow!("playback mixer channel full or closed"))
+    }
+}
+
+impl Clone for DynamicPlaybackHandle {
+    fn clone(&self) -> Self {
+        Self {
+            add_tx: self.add_tx.clone(),
+        }
+    }
+}
+
+impl DynamicPlaybackMixer {
+    /// Create a new dynamic playback mixer.
+    /// Returns the mixer and a handle to add sources.
+    pub fn new() -> (Self, DynamicPlaybackHandle) {
+        let (add_tx, add_rx) = std::sync::mpsc::sync_channel(16);
+        let mixer = Self {
+            sources: Vec::new(),
+            add_rx,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channel_count: 2,
+            },
+            mix_buf: Vec::new(),
+        };
+        let handle = DynamicPlaybackHandle { add_tx };
+        (mixer, handle)
+    }
+
+    /// Run the playback loop, continuously mixing sources and outputting to sink.
+    /// This blocks and should be run in a dedicated thread.
+    pub fn play_to(mut self, mut sink: impl AudioSink) {
+        const INTERVAL: Duration = Duration::from_millis(20);
+        let samples_per_frame = (self.format.sample_rate / 1000) * INTERVAL.as_millis() as u32;
+        let buf_size = samples_per_frame as usize * self.format.channel_count as usize;
+        let mut output_buf = vec![0.0f32; buf_size];
+        
+        loop {
+            let start = Instant::now();
+            
+            // Check for new sources
+            while let Ok(source) = self.add_rx.try_recv() {
+                info!("DynamicPlaybackMixer: added new source, total: {}", self.sources.len() + 1);
+                self.sources.push(source);
+            }
+            
+            // Mix all sources
+            output_buf.fill(0.0);
+            
+            if !self.sources.is_empty() {
+                // Ensure mix_buf is the right size
+                if self.mix_buf.len() != buf_size {
+                    self.mix_buf.resize(buf_size, 0.0);
+                }
+                
+                // Read from each source and mix
+                let mut active_sources = 0;
+                for source in &mut self.sources {
+                    self.mix_buf.fill(0.0);
+                    if let Ok(Some(_)) = source.pop_samples(&mut self.mix_buf) {
+                        // Check if source has any non-zero samples
+                        let has_audio = self.mix_buf.iter().any(|&s| s.abs() > 0.001);
+                        if has_audio {
+                            active_sources += 1;
+                        }
+                        // Add to output
+                        for (i, &sample) in self.mix_buf.iter().enumerate() {
+                            output_buf[i] += sample;
+                        }
+                    }
+                }
+                
+                // Apply soft clipping if we mixed multiple sources
+                if active_sources > 1 {
+                    for sample in &mut output_buf {
+                        *sample = soft_clip(*sample);
+                    }
+                }
+            }
+            
+            // Output to sink
+            if let Err(err) = sink.push_samples(&output_buf) {
+                warn!("DynamicPlaybackMixer: sink error: {err}");
+                break;
+            }
+            
+            // Maintain timing
+            let elapsed = start.elapsed();
+            if elapsed < INTERVAL {
+                std::thread::sleep(INTERVAL - elapsed);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Watcher Manager (tracks all connected watchers and their audio pipelines)
+// ============================================================================
+
+use std::collections::HashMap;
+
+/// Manages multiple watcher connections and their audio pipelines.
+/// Handles per-watcher audio for future AEC and local playback of all watcher mics.
+pub struct WatcherManager {
+    /// Base audio source template (system + publish mic) - cloned for each watcher
+    base_audio: Box<dyn AudioSource>,
+    /// Active watcher pipelines by watcher ID
+    watchers: HashMap<String, WatcherAudioPipeline>,
+    /// Handle to add sources to local playback mixer
+    playback_handle: DynamicPlaybackHandle,
+}
+
+impl WatcherManager {
+    /// Create a new WatcherManager.
+    /// 
+    /// # Arguments
+    /// * `base_audio` - Base audio source (will be cloned for each watcher)
+    /// * `playback_handle` - Handle to add watcher mics to local playback
+    pub fn new(
+        base_audio: Box<dyn AudioSource>,
+        playback_handle: DynamicPlaybackHandle,
+    ) -> Self {
+        Self {
+            base_audio,
+            watchers: HashMap::new(),
+            playback_handle,
+        }
+    }
+
+    /// Add a new watcher and create their audio pipeline.
+    /// Returns the audio source to publish to this watcher.
+    pub fn add_watcher(&mut self, watcher_id: String) -> Box<dyn AudioSource> {
+        let base_audio = self.base_audio.cloned_boxed();
+        let pipeline = WatcherAudioPipeline::new(watcher_id.clone(), base_audio);
+        
+        // Get the output audio for this watcher
+        let output = pipeline.cloned_boxed();
+        
+        self.watchers.insert(watcher_id.clone(), pipeline);
+        info!("WatcherManager: added watcher {}, total: {}", watcher_id, self.watchers.len());
+        
+        output
+    }
+
+    /// Set the watcher's mic audio source.
+    /// This also adds the mic to local playback so the publisher can hear them.
+    pub fn set_watcher_mic(&mut self, watcher_id: &str, mic: Box<dyn AudioSource>) {
+        // Add to local playback (publisher hears this watcher)
+        let mic_for_playback = mic.cloned_boxed();
+        if let Err(err) = self.playback_handle.add_source(mic_for_playback) {
+            warn!("WatcherManager: failed to add mic to playback: {err}");
+        }
+        
+        // Store in pipeline for future AEC
+        if let Some(pipeline) = self.watchers.get_mut(watcher_id) {
+            pipeline.set_watcher_mic(mic);
+            info!("WatcherManager: set mic for watcher {}", watcher_id);
+        } else {
+            warn!("WatcherManager: watcher {} not found for mic assignment", watcher_id);
+        }
+    }
+
+    /// Remove a watcher when they disconnect.
+    pub fn remove_watcher(&mut self, watcher_id: &str) {
+        if self.watchers.remove(watcher_id).is_some() {
+            info!("WatcherManager: removed watcher {}, remaining: {}", watcher_id, self.watchers.len());
+        }
+    }
+
+    /// Get the number of connected watchers.
+    pub fn watcher_count(&self) -> usize {
+        self.watchers.len()
+    }
+
+    /// Check if a watcher exists.
+    pub fn has_watcher(&self, watcher_id: &str) -> bool {
+        self.watchers.contains_key(watcher_id)
+    }
+
+    /// Get a reference to a watcher's pipeline.
+    pub fn get_watcher(&self, watcher_id: &str) -> Option<&WatcherAudioPipeline> {
+        self.watchers.get(watcher_id)
+    }
+
+    /// Get a mutable reference to a watcher's pipeline.
+    pub fn get_watcher_mut(&mut self, watcher_id: &str) -> Option<&mut WatcherAudioPipeline> {
+        self.watchers.get_mut(watcher_id)
     }
 }
 
@@ -766,6 +1592,19 @@ impl AudioBackend {
     pub async fn default_microphone(&self) -> anyhow::Result<Box<dyn AudioSource>> {
         // Note: CPAL input stream creation is synchronous; keep async API for callers.
         Ok(Box::new(CpalMicrophoneSource::new_48k_stereo()?))
+    }
+
+    /// Capture system audio output (what you hear from speakers) at 48kHz stereo.
+    /// Uses WASAPI loopback on Windows. Returns an error on other platforms.
+    #[cfg(target_os = "windows")]
+    pub async fn system_audio(&self) -> anyhow::Result<Box<dyn AudioSource>> {
+        Ok(Box::new(CpalSystemAudioSource::new_48k_stereo()?))
+    }
+
+    /// Capture system audio output - not available on this platform.
+    #[cfg(not(target_os = "windows"))]
+    pub async fn system_audio(&self) -> anyhow::Result<Box<dyn AudioSource>> {
+        anyhow::bail!("System audio capture is only available on Windows")
     }
 
     pub async fn default_speaker(&self) -> anyhow::Result<OutputControl> {

@@ -5,12 +5,17 @@ use iroh::Endpoint;
 use iroh_live::{
     Live, LiveSession,
     audio::AudioBackend,
-    ffmpeg::{FfmpegAudioDecoder, FfmpegVideoDecoder, ffmpeg_log_init},
+    av::AudioPreset,
+    ffmpeg::{FfmpegAudioDecoder, FfmpegVideoDecoder, OpusEncoder, ffmpeg_log_init},
+    publish::{AudioRenditions, PublishBroadcast},
     subscribe::{AudioTrack, SubscribeBroadcast, WatchTrack},
     ticket::LiveTicket,
     util::StatsSmoother,
 };
 use n0_error::{Result, StackResultExt, anyerr};
+
+/// Broadcast name for watch.rs microphone audio (publisher will subscribe to this)
+const WATCH_MIC_BROADCAST: &str = "watch-mic";
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -23,49 +28,73 @@ fn main() -> Result<()> {
 
     println!("connecting to {ticket} ...");
 
-    // Start eframe FIRST - before any async/network code
-    // This ensures winit initializes COM correctly
+    // Create tokio runtime BEFORE eframe to set up network
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // Initialize audio backend
+    let audio_ctx = AudioBackend::new();
+
+    // Connect to publisher, publish mic audio, and subscribe to broadcast
+    let (endpoint, session, subscribe_broadcast, video, audio, mic_broadcast) = rt.block_on({
+        let audio_ctx = audio_ctx.clone();
+        async move {
+            // Create endpoint (no router needed - we don't accept incoming connections)
+            let endpoint = Endpoint::bind().await?;
+            let live = Live::new(endpoint.clone());
+
+            // Connect to the publisher first
+            let mut session = live.connect(ticket.endpoint_id).await?;
+            println!("connected to publisher!");
+            
+            // Subscribe to publisher's video/audio broadcast
+            let consumer = session.subscribe(&ticket.broadcast_name).await?;
+            let subscribe_broadcast = SubscribeBroadcast::new(consumer).await?;
+            let audio_out = audio_ctx.default_speaker().await?;
+            let audio = subscribe_broadcast.listen::<FfmpegAudioDecoder>(audio_out)?;
+            let video = subscribe_broadcast.watch::<FfmpegVideoDecoder>()?;
+
+            // Set up microphone publishing (publisher will detect and subscribe to this)
+            let mic = audio_ctx.default_microphone().await?;
+            let mut mic_broadcast = PublishBroadcast::new();
+            let audio_renditions = AudioRenditions::new::<OpusEncoder>(mic, [AudioPreset::Hq]);
+            mic_broadcast.set_audio(Some(audio_renditions))?;
+            live.publish(WATCH_MIC_BROADCAST, mic_broadcast.producer()).await?;
+            println!("publishing mic audio as '{}'", WATCH_MIC_BROADCAST);
+
+            n0_error::Ok((endpoint, session, subscribe_broadcast, video, audio, mic_broadcast))
+        }
+    }).expect("Failed to connect");
+
+    let _guard = rt.enter();
+    let mut native_options = eframe::NativeOptions::default();
+    // On Windows, winit's drag-and-drop support calls `OleInitialize` (STA) and can
+    // panic with `RPC_E_CHANGED_MODE` if something else initialized COM differently
+    // on the same thread. Disable it to avoid crashing.
+    #[cfg(target_os = "windows")]
+    {
+        native_options.viewport = native_options.viewport.with_drag_and_drop(false);
+    }
+
+    // Start eframe
     eframe::run_native(
-        "IrohLive",
-        eframe::NativeOptions::default(),
+        "IrohLive Watch",
+        native_options,
         Box::new(move |cc| {
-            // Create tokio runtime INSIDE eframe callback
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            // Initialize audio backend
-            let audio_ctx = AudioBackend::new();
-
-            // Now do the connection
-            let (endpoint, session, broadcast, video, audio) = rt.block_on({
-                let audio_ctx = audio_ctx.clone();
-                async move {
-                    let endpoint = Endpoint::bind().await?;
-                    let live = Live::new(endpoint.clone());
-                    let mut session = live.connect(ticket.endpoint_id).await?;
-                    println!("connected!");
-                    let consumer = session.subscribe(&ticket.broadcast_name).await?;
-                    let broadcast = SubscribeBroadcast::new(consumer).await?;
-                    let audio_out = audio_ctx.default_speaker().await?;
-                    let audio = broadcast.listen::<FfmpegAudioDecoder>(audio_out)?;
-                    let video = broadcast.watch::<FfmpegVideoDecoder>()?;
-                    n0_error::Ok((endpoint, session, broadcast, video, audio))
-                }
-            }).expect("Failed to connect");
-
             let app = App::new(
                 cc.egui_ctx.clone(),
                 video,
                 audio_ctx,
                 audio,
-                broadcast,
+                subscribe_broadcast,
                 StatsSmoother::new(),
                 endpoint,
                 session,
                 rt,
                 30,
+                mic_broadcast,
             );
             Ok(Box::new(app))
         }),
@@ -91,6 +120,8 @@ struct App {
     target_fps: u32,
     selected_res: String,
     scaling_mode: ScalingMode,
+    /// Our microphone publish broadcast (kept alive)
+    _mic_broadcast: PublishBroadcast,
 }
 
 impl App {
@@ -106,6 +137,7 @@ impl App {
         session: LiveSession,
         rt: tokio::runtime::Runtime,
         target_fps: u32,
+        mic_broadcast: PublishBroadcast,
     ) -> Self {
         let current_track = video.rendition().to_string();
         let (selected_res, _) = Self::parse_track_name(&current_track);
@@ -122,6 +154,7 @@ impl App {
             target_fps,
             selected_res,
             scaling_mode: ScalingMode::Original,
+            _mic_broadcast: mic_broadcast,
         }
     }
 

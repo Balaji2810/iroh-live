@@ -147,6 +147,23 @@ impl SubscribeBroadcast {
             .flatten()
             .map(|(name, _config)| name.as_str())
     }
+
+    /// Get audio catalog information (if audio is published).
+    pub fn audio_info(&self) -> Option<&hang::catalog::Audio> {
+        self.catalog.audio.as_ref()
+    }
+
+    /// Subscribe to an audio track by name and return the raw track consumer.
+    /// Useful for creating a DecodedAudioSource.
+    pub fn subscribe_audio_track(&self, name: &str) -> n0_error::Result<TrackConsumer> {
+        let audio = self.catalog.audio.as_ref().context("no audio published")?;
+        let _config = audio.renditions.get(name).context("rendition not found")?;
+        let consumer = TrackConsumer::new(self.broadcast.subscribe_track(&Track {
+            name: name.to_string(),
+            priority: audio.priority,
+        }));
+        Ok(consumer)
+    }
 }
 
 pub(crate) fn select_rendition<T, P: ToString>(
