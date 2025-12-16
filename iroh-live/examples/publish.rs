@@ -152,6 +152,7 @@ async fn main() -> n0_error::Result {
         }
     });
 
+    
     // Wait for ctrl-c and then shutdown.
     tokio::signal::ctrl_c().await?;
     live.shutdown();
