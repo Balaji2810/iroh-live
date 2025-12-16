@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -33,6 +33,11 @@ pub type InputStreamHandle = Arc<Mutex<StreamReaderState>>;
 pub struct OutputControl {
     handle: OutputStreamHandle,
     paused: Arc<AtomicBool>,
+    /// Counter for tracking underflow events
+    underflow_count: Arc<AtomicU64>,
+    /// Last time we adjusted buffers (for future use in more sophisticated adaptive logic)
+    #[allow(dead_code)]
+    last_adjustment: Arc<Mutex<Instant>>,
 }
 
 impl AudioSink for OutputControl {
@@ -64,10 +69,18 @@ impl AudioSink for OutputControl {
             }
         };
 
-        // If this happens excessively in Release mode, you may want to consider
-        // increasing [`StreamWriterConfig::channel_config.latency_seconds`].
+        // ADAPTIVE: Track underflow and log with count
         if handle.underflow_occurred() {
-            warn!("Underflow occured in stream writer node!");
+            let count = self.underflow_count.fetch_add(1, Ordering::Relaxed);
+            warn!("Underflow occurred in stream writer node! (total: {})", count + 1);
+            
+            // Log adaptive buffer suggestion if underflow is frequent
+            if (count + 1) % 10 == 0 {
+                warn!(
+                    "Frequent underflow detected ({} total). Consider increasing buffer sizes or checking network latency.",
+                    count + 1
+                );
+            }
         }
 
         // If this happens excessively in Release mode, you may want to consider
@@ -97,6 +110,8 @@ impl OutputControl {
         Self {
             handle,
             paused: Arc::new(AtomicBool::new(false)),
+            underflow_count: Arc::new(AtomicU64::new(0)),
+            last_adjustment: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
@@ -846,6 +861,10 @@ pub struct DecodedAudioSource {
     resampler_out: Vec<Vec<f32>>,
     /// Ring buffer for storing resampled audio ready to be popped
     output_queue: VecDeque<f32>,
+    /// Adaptive minimum threshold (samples per channel) - adjusts based on underflow
+    adaptive_min: Arc<AtomicU64>,
+    /// Counter for tracking low buffer conditions
+    low_count: Arc<AtomicU64>,
 }
 
 impl DecodedAudioSource {
@@ -974,6 +993,8 @@ impl DecodedAudioSource {
             resampler_in,
             resampler_out,
             output_queue: VecDeque::new(),
+            adaptive_min: Arc::new(AtomicU64::new(128)), // Start with 128 samples per channel
+            low_count: Arc::new(AtomicU64::new(0)),
         })
     }
 }
@@ -982,6 +1003,7 @@ impl DecodedAudioSource {
 impl AudioSource for DecodedAudioSource {
     fn cloned_boxed(&self) -> Box<dyn AudioSource> {
         // Cannot truly clone a network stream, return a silent source
+        // Note: adaptive_min and low_count are not cloned as they're per-instance
         Box::new(SilentAudioSource { format: self.format })
     }
 
@@ -1013,13 +1035,48 @@ impl AudioSource for DecodedAudioSource {
         // (no dynamic adjustment since FftFixedOut doesn't support it).
         // The queue naturally handles timing variations.
         
+        // ADAPTIVE: Adjust minimum threshold based on how often we run low
+        let adaptive_min = self.adaptive_min.load(Ordering::Relaxed) as usize;
+        let min_samples = adaptive_min * channels;
+        
+        // Check if we're below the adaptive threshold
+        if queue_size < min_samples {
+            let low_count = self.low_count.fetch_add(1, Ordering::Relaxed);
+            // If we're low too often, increase the minimum threshold
+            if low_count > 50 && adaptive_min < 512 {
+                let new_min = (adaptive_min * 2).min(512);
+                self.adaptive_min.store(new_min as u64, Ordering::Relaxed);
+                warn!(
+                    "Adaptive buffer: increased minimum threshold to {} samples/channel (was {}) due to frequent underruns",
+                    new_min, adaptive_min
+                );
+                self.low_count.store(0, Ordering::Relaxed); // Reset counter
+            }
+        } else if queue_size > min_samples * 4 {
+            // If we have plenty of buffer, gradually reduce threshold (optimize latency)
+            if adaptive_min > 128 {
+                let current_low = self.low_count.load(Ordering::Relaxed);
+                if current_low > 0 {
+                    self.low_count.store(current_low.saturating_sub(1), Ordering::Relaxed);
+                } else if adaptive_min > 128 {
+                    // Only reduce if we've been stable for a while
+                    let new_min = (adaptive_min / 2).max(128);
+                    self.adaptive_min.store(new_min as u64, Ordering::Relaxed);
+                    info!(
+                        "Adaptive buffer: reduced minimum threshold to {} samples/channel (stable, was {})",
+                        new_min, adaptive_min
+                    );
+                }
+            }
+        }
+        
+        // Use the adaptive minimum
+        let current_min = self.adaptive_min.load(Ordering::Relaxed) as usize;
+        let min_samples = current_min * channels;
+        
         // While we don't have enough output samples, try to process more input
         while self.output_queue.len() < buf.len() {
             let available_input = q.len();
-            
-            // Lower threshold: only need 128 samples per channel (256 total for stereo)
-            // This allows audio to start playing sooner and reduces latency
-            let min_samples = 128 * channels;
             
             if available_input < min_samples {
                 break; // Wait for more data
