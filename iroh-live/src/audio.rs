@@ -882,20 +882,30 @@ impl DecodedAudioSource {
         // Spawn tokio task to receive packets from the network
         let _task_handle = tokio::spawn(async move {
             let mut consumer = consumer;
+            let mut packet_count = 0u64;
             loop {
                 match consumer.read().await {
                     Ok(Some(frame)) => {
+                        packet_count += 1;
+                        if packet_count % 100 == 0 {
+                            tracing::debug!("DecodedAudioSource: received {} packets", packet_count);
+                        }
                         if packet_tx.send(frame).is_err() {
+                            tracing::debug!("DecodedAudioSource: packet channel closed, stopping receiver");
                             break;
                         }
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        tracing::debug!("DecodedAudioSource: stream ended (read None)");
+                        break;
+                    }
                     Err(err) => {
-                        tracing::warn!("decoded audio source: failed to read frame: {err:?}");
+                        tracing::warn!("DecodedAudioSource: failed to read frame: {err:?}");
                         break;
                     }
                 }
             }
+            tracing::info!("DecodedAudioSource: receiver task ended after {} packets", packet_count);
         });
         
         // Spawn thread to decode packets
@@ -903,38 +913,56 @@ impl DecodedAudioSource {
             let mut decoder = decoder;
             // Buffer ~500ms max to allow jitter buffer to work
             let max_samples = (target_format.sample_rate as usize) * (target_format.channel_count as usize) / 2;
+            let mut decoded_packets = 0u64;
+            let mut total_samples = 0u64;
             
             while !stop_thread.load(Ordering::Relaxed) {
                 // Try to receive a packet with timeout
                 match packet_rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(packet) => {
+                        decoded_packets += 1;
                         if let Err(err) = decoder.push_packet(packet) {
-                            tracing::warn!("decoded audio push_packet error: {err}");
+                            tracing::warn!("DecodedAudioSource: push_packet error: {err}");
                             continue;
                         }
                         match decoder.pop_samples() {
                             Ok(Some(samples)) => {
+                                total_samples += samples.len() as u64;
                                 let mut q = queue_thread.lock().unwrap_or_else(|e| e.into_inner());
+                                let before_len = q.len();
                                 q.extend(samples.iter().copied());
                                 // Trim to max buffer size
                                 while q.len() > max_samples {
                                     q.pop_front();
                                 }
+                                if decoded_packets % 100 == 0 {
+                                    tracing::debug!(
+                                        "DecodedAudioSource: decoded {} packets, {} samples, queue: {} -> {} samples",
+                                        decoded_packets, total_samples, before_len, q.len()
+                                    );
+                                }
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                // Decoder needs more packets
+                            }
                             Err(err) => {
-                                tracing::warn!("decoded audio pop_samples error: {err}");
+                                tracing::warn!("DecodedAudioSource: decoder pop_samples error: {err}");
                             }
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        // Keep looping
+                        // Keep looping - this is normal when waiting for packets
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        tracing::debug!("DecodedAudioSource: packet channel disconnected, stopping decoder");
                         break;
                     }
                 }
             }
+            tracing::info!(
+                "DecodedAudioSource: decoder thread ended after {} packets, {} total samples",
+                decoded_packets, total_samples
+            );
         });
         
         Ok(Self {
@@ -963,12 +991,27 @@ impl AudioSource for DecodedAudioSource {
     fn pop_samples(&mut self, buf: &mut [f32]) -> anyhow::Result<Option<usize>> {
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         
+        let channels = self.format.channel_count as usize;
+        let queue_size = q.len();
+        
+        // Log if queue is very low or very high (indicates potential issues)
+        if queue_size < 1024 * channels {
+            tracing::trace!(
+                "DecodedAudioSource::pop_samples: queue low ({} samples, need {}), output_queue: {}",
+                queue_size, 1024 * channels, self.output_queue.len()
+            );
+        } else if queue_size > 48000 * channels * 2 {
+            tracing::trace!(
+                "DecodedAudioSource::pop_samples: queue high ({} samples), output_queue: {}",
+                queue_size, self.output_queue.len()
+            );
+        }
+        
         // Jitter Buffer Logic:
         // 1. Maintain a target buffer level (e.g. 60ms)
         // 2. If buffer > target, speed up (ratio > 1.0)
         // 3. If buffer < target, slow down (ratio < 1.0)
         
-        let channels = self.format.channel_count as usize;
         // Increase target to 80ms to handle video congestion better
         let target_level = 48000 * channels * 80 / 1000; 
         
@@ -1223,19 +1266,36 @@ impl DynamicPlaybackMixer {
                 
                 // Read from each source and mix
                 let mut active_sources = 0;
-                for source in &mut self.sources {
+                for (idx, source) in self.sources.iter_mut().enumerate() {
                     self.mix_buf.fill(0.0);
-                    if let Ok(Some(_)) = source.pop_samples(&mut self.mix_buf) {
-                        // Check if source has any non-zero samples
-                        let has_audio = self.mix_buf.iter().any(|&s| s.abs() > 0.001);
-                        if has_audio {
-                            active_sources += 1;
+                    match source.pop_samples(&mut self.mix_buf) {
+                        Ok(Some(_)) => {
+                            // Check if source has any non-zero samples
+                            let has_audio = self.mix_buf.iter().any(|&s| s.abs() > 0.001);
+                            if has_audio {
+                                active_sources += 1;
+                            }
+                            // Add to output
+                            for (i, &sample) in self.mix_buf.iter().enumerate() {
+                                output_buf[i] += sample;
+                            }
                         }
-                        // Add to output
-                        for (i, &sample) in self.mix_buf.iter().enumerate() {
-                            output_buf[i] += sample;
+                        Ok(None) => {
+                            // Source returned None (end of stream)
+                            tracing::debug!("DynamicPlaybackMixer: source {} returned None", idx);
+                        }
+                        Err(err) => {
+                            tracing::warn!("DynamicPlaybackMixer: source {} error: {err}", idx);
                         }
                     }
+                }
+                
+                // Log periodically if we have sources but no active audio
+                if !self.sources.is_empty() && active_sources == 0 {
+                    tracing::trace!(
+                        "DynamicPlaybackMixer: {} sources but no active audio",
+                        self.sources.len()
+                    );
                 }
                 
                 // Apply soft clipping if we mixed multiple sources
@@ -1313,20 +1373,27 @@ impl WatcherManager {
     /// Set the watcher's mic audio source.
     /// This also adds the mic to local playback so the publisher can hear them.
     pub fn set_watcher_mic(&mut self, watcher_id: &str, mic: Box<dyn AudioSource>) {
+        info!("WatcherManager: set_watcher_mic called for watcher {}, format: {:?}", watcher_id, mic.format());
+        
         // Add to local playback (publisher hears this watcher)
         // We must use the REAL mic source here because DecodedAudioSource cannot be cloned (clones are silent).
         // For now, we clone the SILENT version for the pipeline (AEC placeholder).
         // TODO: Implement SplitAudioSource to allow both playback and AEC.
         let mic_for_pipeline = mic.cloned_boxed();
         
-        if let Err(err) = self.playback_handle.add_source(mic) {
-            warn!("WatcherManager: failed to add mic to playback: {err}");
+        match self.playback_handle.add_source(mic) {
+            Ok(()) => {
+                info!("WatcherManager: successfully added mic to playback for watcher {}", watcher_id);
+            }
+            Err(err) => {
+                warn!("WatcherManager: failed to add mic to playback for watcher {}: {err}", watcher_id);
+            }
         }
         
         // Store in pipeline for future AEC
         if let Some(pipeline) = self.watchers.get_mut(watcher_id) {
             pipeline.set_watcher_mic(mic_for_pipeline);
-            info!("WatcherManager: set mic for watcher {}", watcher_id);
+            info!("WatcherManager: set mic for watcher {} (stored in pipeline for AEC)", watcher_id);
         } else {
             warn!("WatcherManager: watcher {} not found for mic assignment", watcher_id);
         }
