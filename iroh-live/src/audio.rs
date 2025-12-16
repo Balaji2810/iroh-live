@@ -1507,8 +1507,8 @@ impl AudioDriver {
                 sample_rate.try_into().unwrap(),
                 output_stream_sample_rate,
                 ResamplingChannelConfig {
-                    capacity_seconds: 0.15,   // Allow up to 150ms buffer
-                    latency_seconds: 0.04,    // Start playback after 40ms buffered (low-latency)
+                    capacity_seconds: 0.5,    // Allow up to 500ms buffer
+                    latency_seconds: 0.2,     // Start playback after 200ms buffered (safer for network)
                     ..Default::default()
                 },
             )
@@ -1567,8 +1567,8 @@ impl AudioDriver {
                 sample_rate.try_into().unwrap(),
                 input_stream_sample_rate,
                 ResamplingChannelConfig {
-                    capacity_seconds: 0.15,   // Allow up to 150ms buffer (low-latency)
-                    latency_seconds: 0.04,    // 40ms latency target (low-latency)
+                    capacity_seconds: 0.5,    // Allow up to 500ms buffer (safer for network)
+                    latency_seconds: 0.2,     // 200ms latency target (safer for network)
                     ..Default::default()
                 },
             )
