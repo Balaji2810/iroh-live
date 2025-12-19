@@ -34,6 +34,15 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     ffmpeg_log_init();
     let cli = Cli::parse();
+    
+    // Initialize COM on Windows before any library uses it
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED };
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED );
+        }
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -27,12 +27,14 @@ use hang::catalog::AudioConfig;
 use tokio::sync::{mpsc, mpsc::error::TryRecvError, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
+#[cfg(not(target_os = "windows"))]
 use self::aec::{AecCaptureNode, AecProcessor, AecProcessorConfig, AecRenderNode};
 use crate::{
     av::{AudioFormat, AudioSink, AudioSinkHandle, AudioSource},
     util::spawn_thread,
 };
 
+#[cfg(not(target_os = "windows"))]
 mod aec;
 
 type StreamWriterHandle = Arc<Mutex<StreamWriterState>>;
@@ -224,8 +226,11 @@ pub struct AudioBackend {
 struct AudioDriver {
     cx: FirewheelContext,
     rx: mpsc::Receiver<AudioCommand>,
+    #[cfg(not(target_os = "windows"))]
     aec_processor: AecProcessor,
+    #[cfg(not(target_os = "windows"))]
     aec_render_node: NodeID,
+    #[cfg(not(target_os = "windows"))]
     aec_capture_node: NodeID,
     peak_meters: HashMap<NodeID, Arc<Mutex<PeakMeterSmoother<2>>>>,
 }
@@ -268,23 +273,39 @@ impl AudioDriver {
             num_outputs: ChannelCount::new(2).unwrap(),
         });
 
+        #[cfg(not(target_os = "windows"))]
         let aec_processor = AecProcessor::new(AecProcessorConfig::stereo_in_out(), true)
             .expect("failed to initialize AEC processor");
+        #[cfg(not(target_os = "windows"))]
         let aec_render_node = cx.add_node(AecRenderNode::default(), Some(aec_processor.clone()));
+        #[cfg(not(target_os = "windows"))]
         let aec_capture_node = cx.add_node(AecCaptureNode::default(), Some(aec_processor.clone()));
 
-        let layout = &[(0, 0), (1, 1)];
+        #[cfg(not(target_os = "windows"))]
+        {
+            let layout = &[(0, 0), (1, 1)];
 
-        cx.connect(cx.graph_in_node_id(), aec_capture_node, layout, true)
-            .unwrap();
-        cx.connect(aec_render_node, cx.graph_out_node_id(), layout, true)
-            .unwrap();
+            cx.connect(cx.graph_in_node_id(), aec_capture_node, layout, true)
+                .unwrap();
+            cx.connect(aec_render_node, cx.graph_out_node_id(), layout, true)
+                .unwrap();
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // On Windows, connect graph input/output directly without AEC
+            let layout = &[(0, 0), (1, 1)];
+            cx.connect(cx.graph_in_node_id(), cx.graph_out_node_id(), layout, true)
+                .unwrap();
+        }
 
         Self {
             cx,
             rx,
+            #[cfg(not(target_os = "windows"))]
             aec_processor,
+            #[cfg(not(target_os = "windows"))]
             aec_render_node,
+            #[cfg(not(target_os = "windows"))]
             aec_capture_node,
             peak_meters: Default::default(),
         }
@@ -293,6 +314,7 @@ impl AudioDriver {
     fn run(&mut self) {
         const INTERVAL: Duration = Duration::from_millis(10);
         const PEAK_UPDATE_INTERVAL: Duration = Duration::from_millis(40);
+        #[cfg(not(target_os = "windows"))]
         let mut last_delay: f64 = 0.;
         let mut last_peak_update = Instant::now();
 
@@ -328,13 +350,16 @@ impl AudioDriver {
                 // }
             }
 
-            if let Some(info) = self.cx.stream_info() {
-                let delay = info.input_to_output_latency_seconds;
-                if (last_delay - delay).abs() > (1. / 1000.) {
-                    let delay_ms = (delay * 1000.) as u32;
-                    info!("update processor delay to {delay_ms}ms");
-                    self.aec_processor.set_stream_delay(delay_ms);
-                    last_delay = delay;
+            #[cfg(not(target_os = "windows"))]
+            {
+                if let Some(info) = self.cx.stream_info() {
+                    let delay = info.input_to_output_latency_seconds;
+                    if (last_delay - delay).abs() > (1. / 1000.) {
+                        let delay_ms = (delay * 1000.) as u32;
+                        info!("update processor delay to {delay_ms}ms");
+                        self.aec_processor.set_stream_delay(delay_ms);
+                        last_delay = delay;
+                    }
                 }
             }
 
@@ -413,7 +438,10 @@ impl AudioDriver {
                 ..Default::default()
             }),
         );
+        #[cfg(not(target_os = "windows"))]
         let graph_out = self.aec_render_node;
+        #[cfg(target_os = "windows")]
+        let graph_out = self.cx.graph_out_node_id();
         // let graph_out_info = self
         //     .cx
         //     .node_info(graph_out)
@@ -477,7 +505,10 @@ impl AudioDriver {
                 ..Default::default()
             }),
         );
+        #[cfg(not(target_os = "windows"))]
         let graph_in_node_id = self.aec_capture_node;
+        #[cfg(target_os = "windows")]
+        let graph_in_node_id = self.cx.graph_in_node_id();
         let graph_in_info = self
             .cx
             .node_info(graph_in_node_id)
