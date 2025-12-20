@@ -18,7 +18,7 @@ It uses [moq-rs](https://github.com/kixelated/moq) to transfer audio and video s
   * Capture screens (with [xcap](https://github.com/nashaofu/xcap/))
   * Encode and decode video (h264) and audio (Opus) using [ffmpeg](https://docs.rs/ffmpeg-next/latest/ffmpeg_next/). Video encoding is hardware accelerated on supported platforms.
   * Support multiple renditions and on-demand switching of the encoding
-  
+
 There's still bugs and a lot of missing optimizations. This is an early, work-in-progress preview!
 
 ## Building
@@ -33,6 +33,106 @@ By default `ffmpeg` is dynamically linked. Enable the `static` feature to build 
 
 * For building with `static` feature: `apt install nasm pkg-config`
 
+##### Windows
+
+Windows builds require MSYS2 with the UCRT64 environment.
+
+1. **Download and install MSYS2** from [https://www.msys2.org/]()
+2. **Configure VSCode** (if using VSCode): Add the following to your `settings.json`:
+
+```json
+"terminal.integrated.profiles.windows": {
+    "PowerShell": {
+        "source": "PowerShell",
+        "icon": "terminal-powershell"
+    },
+    "Command Prompt": {
+        "path": [
+            "${env:windir}\\Sysnative\\cmd.exe",
+            "${env:windir}\\System32\\cmd.exe"
+        ],
+        "args": [],
+        "icon": "terminal-cmd"
+    },
+    "bash (MSYS2)": {
+        "path": "C:\\msys64\\usr\\bin\\bash.exe",
+        "args": [
+            "--login",
+            "-i"
+        ],
+        "env": {
+            "CHERE_INVOKING": "1"
+        }
+    },
+    "UCRT64": {
+        "path": "C:\\msys64\\usr\\bin\\bash.exe",
+        "args": [
+            "--login",
+            "-i"
+        ],
+        "env": {
+            "MSYSTEM": "UCRT64",
+            "CHERE_INVOKING": "1"
+        }
+    },
+    "MINGW64": {
+        "path": "C:\\msys64\\usr\\bin\\bash.exe",
+        "args": [
+            "--login",
+            "-i"
+        ],
+        "env": {
+            "MSYSTEM": "MINGW64",
+            "CHERE_INVOKING": "1"
+        }
+    }
+}
+```
+
+3. **Update package database**: Run in **UCRT64** terminal (not base MSYS2):
+
+```bash
+pacman -Syu
+```
+
+4. **Install Rust**: Run in the **UCRT64** terminal (not base MSYS2):
+
+```bash
+pacman -S mingw-w64-ucrt-x86_64-rust
+```
+
+5. **Install build tools**: Run in the **UCRT64** terminal:
+
+```bash
+pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-toolchain autoconf automake libtool --disable-download-timeout
+```
+
+6. **Install base development tools**:
+
+```bash
+pacman -S base-devel --disable-download-timeout
+```
+
+7. **Install clang, LLVM, and FFmpeg**:
+
+```bash
+pacman -S mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-llvm mingw-w64-ucrt-x86_64-ffmpeg mingw-w64-ucrt-x86_64-pkg-config
+```
+
+8. **Install webrtc-audio-processing**:
+
+```bash
+pacman -S mingw-w64-ucrt-x86_64-webrtc-audio-processing
+```
+
+9. **Set environment variables**: Add to `~/.bashrc`:
+
+```bash
+echo 'export LIBCLANG_PATH=/ucrt64/bin' >> ~/.bashrc
+echo 'export PKG_CONFIG_PATH=/ucrt64/lib/pkgconfig' >> ~/.bashrc
+source ~/.bashrc
+```
+
 ## Demo and examples
 
 Check out the [`rooms`](iroh-live/examples/rooms.rs) example:
@@ -42,6 +142,7 @@ cargo run --release --example rooms
 ```
 
 This will print a *room ticket*. Copy this to another device, and run:
+
 ```
 cargo run --release --example rooms -- <TICKET>
 ```
@@ -60,10 +161,10 @@ Copyright 2025 N0, INC.
 
 This project is licensed under either of
 
- * Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
-   http://www.apache.org/licenses/LICENSE-2.0)
- * MIT license ([LICENSE-MIT](LICENSE-MIT) or
-   http://opensource.org/licenses/MIT)
+* Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
+  http://www.apache.org/licenses/LICENSE-2.0)
+* MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  http://opensource.org/licenses/MIT)
 
 at your option.
 
