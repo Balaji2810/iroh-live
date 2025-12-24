@@ -35,14 +35,8 @@ fn main() -> Result<()> {
     ffmpeg_log_init();
     let cli = Cli::parse();
     
-    // Initialize COM on Windows before any library uses it
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED };
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED );
-        }
-    }
+    // Initialize platform requirements for capture (COM on Windows)
+    iroh_live::capture::init();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

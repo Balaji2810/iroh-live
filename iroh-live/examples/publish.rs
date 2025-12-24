@@ -16,14 +16,8 @@ async fn main() -> n0_error::Result {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
-    // Initialize COM on Windows before any library uses it
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED };
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED );
-        }
-    }
+    // Initialize platform requirements for capture (COM on Windows)
+    iroh_live::capture::init();
 
     // Setup audio backend.
     let audio_ctx = AudioBackend::new();

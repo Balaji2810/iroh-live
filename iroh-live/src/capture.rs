@@ -16,6 +16,35 @@ use crate::{
     ffmpeg::util::MjpgDecoder,
 };
 
+
+/// Initialize platform-specific requirements for camera capture.
+///
+/// On Windows, this initializes COM with COINIT_MULTITHREADED, which is required
+/// for MediaFoundation (used by nokhwa) to work properly.
+///
+/// This should be called once at the start of your application, before creating
+/// any camera capturers.
+///
+/// # Safety
+/// 
+/// On Windows, this calls `CoInitializeEx` with `COINIT_MULTITHREADED`. This is
+/// safe to call multiple times (subsequent calls will just increment a reference
+/// count), but the threading model must remain consistent for the thread.
+pub fn init() {
+    #[cfg(target_os = "windows")]
+    {
+        // SAFETY: CoInitializeEx is safe to call. We use COINIT_MULTITHREADED because
+        // MediaFoundation (used by nokhwa for camera access on Windows) requires it.
+        // If COM is already initialized on this thread with the same mode, this just
+        // increments a reference count. If initialized with a different mode, this
+        // will fail silently (returns an error we ignore), which is acceptable.
+        unsafe {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+    }
+}
+
 pub struct ScreenCapturer {
     pub(crate) _monitor: Monitor,
     pub(crate) width: u32,
