@@ -28,14 +28,8 @@ fn main() -> Result<()> {
         .context("missing ticket")?;
     let ticket = LiveTicket::deserialize(&ticket_str)?;
 
-    // Initialize COM on Windows before any library uses it
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED };
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED );
-        }
-    }
+    // Initialize platform requirements for capture (COM on Windows)
+    iroh_live::capture::init();
 
     let audio_ctx = AudioBackend::new();
 
