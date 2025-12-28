@@ -132,12 +132,44 @@ impl VideoSource for ScreenCapturer {
                 .recv()
                 .context("Screen recorder did not produce new frame")?,
         };
+        
+        // xcap may provide frame data with stride/padding, especially on ultrawide monitors.
+        // We need to ensure the data is tightly packed (no padding between rows).
+        let width = raw_frame.width;
+        let height = raw_frame.height;
+        let row_bytes = (width as usize) * 4; // RGBA = 4 bytes per pixel
+        let expected_size = row_bytes * (height as usize);
+        
+        let raw_data = if raw_frame.raw.len() == expected_size {
+            // Data is already tightly packed, use as-is
+            trace!("Screen frame {}x{}: data is tightly packed", width, height);
+            raw_frame.raw.into()
+        } else {
+            // Data has stride/padding, repack it
+            let stride = raw_frame.raw.len() / (height as usize);
+            debug!(
+                "Screen frame {}x{}: repacking frame data (stride={}, expected={})",
+                width, height, stride, row_bytes
+            );
+            
+            use bytes::{BufMut, BytesMut};
+            let mut packed = BytesMut::with_capacity(expected_size);
+            
+            for y in 0..(height as usize) {
+                let src_off = y * stride;
+                let src_slice = &raw_frame.raw[src_off..src_off + row_bytes];
+                packed.put(src_slice);
+            }
+            
+            packed.freeze()
+        };
+        
         Ok(Some(VideoFrame {
             format: VideoFormat {
                 pixel_format: PixelFormat::Rgba,
-                dimensions: [raw_frame.width, raw_frame.height],
+                dimensions: [width, height],
             },
-            raw: raw_frame.raw.into(),
+            raw: raw_data,
         }))
     }
 }
