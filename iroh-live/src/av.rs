@@ -111,6 +111,11 @@ pub trait VideoEncoder: VideoEncoderInner {
     fn with_preset(preset: VideoPreset) -> Result<Self>
     where
         Self: Sized;
+    
+    /// Create a new encoder with custom dimensions
+    fn new(width: u32, height: u32, framerate: u32) -> Result<Self>
+    where
+        Self: Sized;
 }
 
 pub trait VideoEncoderInner: Send + 'static {
@@ -207,6 +212,7 @@ impl VideoPreset {
         [Self::P180, Self::P360, Self::P720, Self::P1080]
     }
 
+    /// Returns the default 16:9 dimensions for this preset
     pub fn dimensions(&self) -> (u32, u32) {
         match self {
             Self::P180 => (320, 180),
@@ -214,6 +220,28 @@ impl VideoPreset {
             Self::P720 => (1280, 720),
             Self::P1080 => (1920, 1080),
         }
+    }
+
+    /// Returns dimensions scaled to match the source aspect ratio.
+    /// The height of the preset is maintained, and the width is calculated
+    /// to match the source aspect ratio.
+    pub fn dimensions_for_aspect_ratio(&self, source_width: u32, source_height: u32) -> (u32, u32) {
+        if source_height == 0 {
+            return self.dimensions();
+        }
+        
+        let source_aspect = source_width as f32 / source_height as f32;
+        let target_height = self.height();
+        let target_width = (target_height as f32 * source_aspect).round() as u32;
+        
+        // Ensure dimensions are even (required for most video encoders)
+        let target_width = if target_width % 2 == 0 {
+            target_width
+        } else {
+            target_width + 1
+        };
+        
+        (target_width, target_height)
     }
 
     pub fn width(&self) -> u32 {

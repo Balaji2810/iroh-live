@@ -288,6 +288,7 @@ pub struct VideoRenditions {
     make_encoder: Box<dyn Fn(VideoPreset) -> Result<Box<dyn VideoEncoder>> + Send>,
     source: SharedVideoSource,
     renditions: HashMap<String, VideoPreset>,
+    source_dimensions: (u32, u32),
     _shared_source_cancel_guard: DropGuard,
 }
 
@@ -297,15 +298,25 @@ impl VideoRenditions {
         presets: impl IntoIterator<Item = VideoPreset>,
     ) -> Self {
         let shutdown_token = CancellationToken::new();
+        let source_format = source.format();
+        let source_dimensions = (source_format.dimensions[0], source_format.dimensions[1]);
         let source = SharedVideoSource::new(source, shutdown_token.clone());
         let renditions = presets
             .into_iter()
             .map(|preset| (format!("video-{preset}"), preset))
             .collect();
+        
+        // Capture source dimensions in the closure
+        let dims = source_dimensions;
         Self {
-            make_encoder: Box::new(|preset| Ok(Box::new(E::with_preset(preset)?))),
+            make_encoder: Box::new(move |preset| {
+                // Calculate dimensions based on source aspect ratio
+                let (width, height) = preset.dimensions_for_aspect_ratio(dims.0, dims.1);
+                Ok(Box::new(E::new(width, height, preset.fps())?))
+            }),
             renditions,
             source,
+            source_dimensions,
             _shared_source_cancel_guard: shutdown_token.drop_guard(),
         }
     }
