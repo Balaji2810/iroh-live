@@ -237,6 +237,13 @@ impl RemoteTrackView {
             .map(|video| video.render_image(ctx, available_size))
     }
 
+    fn aspect_ratio(&self) -> f32 {
+        self.video
+            .as_ref()
+            .map(|v| v.aspect_ratio())
+            .unwrap_or(16.0 / 9.0)
+    }
+
     fn render_overlay_in_rect(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let pos = rect.left_bottom() + egui::vec2(8.0, -8.0);
         let overlay_id = egui::Id::new(("overlay", self.id));
@@ -297,6 +304,7 @@ struct VideoView {
     track: WatchTrack,
     size: egui::Vec2,
     texture: egui::TextureHandle,
+    video_aspect_ratio: f32, // width / height of the actual video
 }
 
 impl VideoView {
@@ -310,6 +318,7 @@ impl VideoView {
             size,
             texture,
             track,
+            video_aspect_ratio: 16.0 / 9.0, // Default to 16:9 until we get the first frame
         }
     }
 
@@ -328,6 +337,10 @@ impl VideoView {
         }
         if let Some(frame) = self.track.current_frame() {
             let (w, h) = frame.img().dimensions();
+            // Update aspect ratio based on actual video dimensions
+            if h > 0 {
+                self.video_aspect_ratio = w as f32 / h as f32;
+            }
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [w as usize, h as usize],
                 frame.img().as_raw(),
@@ -336,29 +349,44 @@ impl VideoView {
         }
         egui::Image::from_texture(&self.texture).shrink_to_fit()
     }
+
+    fn aspect_ratio(&self) -> f32 {
+        self.video_aspect_ratio
+    }
 }
 
-/// Show `textures` as squares in a compact auto grid that fills the parent as much as
-/// possible without breaking square aspect.
+/// Show videos in a compact auto grid that fills the parent while preserving
+/// the actual aspect ratios of the videos.
 fn show_video_grid(ctx: &egui::Context, ui: &mut egui::Ui, videos: &mut [RemoteTrackView]) {
     let n = videos.len();
     if n == 0 {
         return;
     }
 
-    // Parent size we’re allowed to use
-    let avail = ui.available_size(); // egui docs recommend this for filling containers
+    // Parent size we're allowed to use
+    let avail = ui.available_size();
+    
     // Choose columns ≈ ceil(sqrt(n)), rows to fit the rest
     let cols = (n as f32).sqrt().ceil() as usize;
     let rows = (n + cols - 1) / cols;
 
-    // Side length of each square in points (fill the limiting axis)
-    let cell = (avail.x / cols as f32).min(avail.y / rows as f32).floor();
-    let cell_size = [cell, cell];
+    // Get the average aspect ratio of all videos to estimate cell sizes
+    let avg_aspect = videos.iter()
+        .map(|v| v.aspect_ratio())
+        .sum::<f32>() / n as f32;
+    
+    // Calculate cell dimensions that respect aspect ratio
+    // We want to maximize usage of available space
+    let cell_width = (avail.x / cols as f32).floor();
+    let cell_height = (avail.y / rows as f32).floor();
+    
+    // Use the aspect ratio to determine which dimension is limiting
+    let cell_w = cell_width.min(cell_height * avg_aspect);
+    let cell_h = cell_w / avg_aspect;
 
-    // Compute the grid’s actual pixel footprint
-    let grid_w = cell * cols as f32;
-    let grid_h = cell * rows as f32;
+    // Compute the grid's actual pixel footprint
+    let grid_w = cell_w * cols as f32;
+    let grid_h = cell_h * rows as f32;
 
     // Center the grid in any leftover space
     let pad_x = ((avail.x - grid_w) * 0.5).max(0.0);
@@ -375,7 +403,12 @@ fn show_video_grid(ctx: &egui::Context, ui: &mut egui::Ui, videos: &mut [RemoteT
                 for _r in 0..rows {
                     for _c in 0..cols {
                         if i < n {
-                            // Force exact square size for each image
+                            // Calculate cell size based on this specific video's aspect ratio
+                            let video_aspect = videos[i].aspect_ratio();
+                            let this_cell_w = cell_w.min(cell_h * video_aspect);
+                            let this_cell_h = this_cell_w / video_aspect;
+                            let cell_size = [this_cell_w, this_cell_h];
+                            
                             if let Some(image) = videos[i].render_image(ctx, cell_size.into()) {
                                 let response = ui.add_sized(cell_size, image);
                                 let rect = response.rect;
@@ -383,8 +416,8 @@ fn show_video_grid(ctx: &egui::Context, ui: &mut egui::Ui, videos: &mut [RemoteT
                             }
                             i += 1;
                         } else {
-                            // Keep the grid rectangular when N isn’t a multiple of cols
-                            ui.allocate_exact_size(Vec2::splat(cell), egui::Sense::hover());
+                            // Keep the grid rectangular when N isn't a multiple of cols
+                            ui.allocate_exact_size(egui::vec2(cell_w, cell_h), egui::Sense::hover());
                         }
                     }
                     ui.end_row();
