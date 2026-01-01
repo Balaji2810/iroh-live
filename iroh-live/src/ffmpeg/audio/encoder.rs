@@ -9,7 +9,7 @@ use crate::{
 };
 
 const SAMPLE_RATE: u32 = 48_000;
-const BITRATE: u64 = 128_000; // 128 kbps
+const BITRATE: u64 = 192_000; // 128 kbps
 
 pub struct OpusEncoder {
     encoder: ffmpeg::encoder::Audio,
@@ -47,6 +47,24 @@ impl OpusEncoder {
         let sample_rate = sample_rate as i32;
         ctx.set_rate(sample_rate);
         ctx.set_bit_rate(bitrate as usize);
+        // ctx.set_format(ffmpeg::format::Sample::F32(
+        //     ffmpeg_next::format::sample::Type::Packed,
+        // ));
+        // ctx.set_time_base(Rational::new(1, sample_rate));
+        // ctx.set_channel_layout(if channel_count == 1 {
+        //     ffmpeg::util::channel_layout::ChannelLayout::MONO
+        // } else {
+        //     ffmpeg::util::channel_layout::ChannelLayout::STEREO
+        // });
+
+        // let encoder = ctx.open()?;
+
+        // Add Opus quality/complexity options for better encoding
+        let mut opts = ffmpeg::Dictionary::new();
+        opts.set("application", "voip"); // Optimize for real-time voice
+        opts.set("frame_duration", "20"); // 20ms frames
+        opts.set("packet_loss", "0"); // Assume no packet loss for better quality
+        
         ctx.set_format(ffmpeg::format::Sample::F32(
             ffmpeg_next::format::sample::Type::Packed,
         ));
@@ -57,7 +75,7 @@ impl OpusEncoder {
             ffmpeg::util::channel_layout::ChannelLayout::STEREO
         });
 
-        let encoder = ctx.open()?;
+        let encoder = ctx.open_as_with(codec, opts)?; // Use open_as_with to apply options        
 
         let extradata = encoder.extradata().unwrap_or(&[]).to_vec();
 
@@ -83,7 +101,7 @@ impl AudioEncoder for OpusEncoder {
         };
         let bitrate = match preset {
             AudioPreset::Hq => BITRATE,
-            AudioPreset::Lq => 32_000,
+            AudioPreset::Lq => 64_000,
         };
         Self::new(SAMPLE_RATE, channels, bitrate)
     }
