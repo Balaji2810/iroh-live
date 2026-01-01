@@ -353,7 +353,7 @@ impl AudioTrack {
     ) -> Result<()> {
         const INTERVAL: Duration = Duration::from_millis(10);
         const INITIAL_BUFFER_MS: u64 = 300; // Wait for 300ms of buffer before starting
-        const MIN_BUFFER_DEPTH: usize = 10; // Maintain at least 10 packets (~100-200ms)
+        const MIN_BUFFER_DEPTH: usize = 5; // Warn when buffer drops below this (~50-100ms)
         
         let mut remote_start = None;
         let loop_start = Instant::now();
@@ -395,32 +395,36 @@ impl AudioTrack {
                 }
             }
 
-            // Play packets if we have enough buffered
-            if buffered_packets.len() > MIN_BUFFER_DEPTH {
-                if let Some(packet) = buffered_packets.pop_front() {
-                    let remote_start = *remote_start.get_or_insert_with(|| packet.timestamp);
+            // Play packet if we have any buffered (after initial startup)
+            if let Some(packet) = buffered_packets.pop_front() {
+                let remote_start = *remote_start.get_or_insert_with(|| packet.timestamp);
 
-                    let loop_elapsed = tick.duration_since(loop_start);
-                    let remote_elapsed: Duration = packet
-                        .timestamp
-                        .checked_sub(remote_start)
-                        .unwrap_or(Timestamp::ZERO)
-                        .into();
-                    let diff_ms =
-                        (loop_elapsed.as_secs_f32() - remote_elapsed.as_secs_f32()) * 1000.;
+                let loop_elapsed = tick.duration_since(loop_start);
+                let remote_elapsed: Duration = packet
+                    .timestamp
+                    .checked_sub(remote_start)
+                    .unwrap_or(Timestamp::ZERO)
+                    .into();
+                let diff_ms =
+                    (loop_elapsed.as_secs_f32() - remote_elapsed.as_secs_f32()) * 1000.;
 
-                    trace!(len = packet.payload.num_bytes(), ts=?packet.timestamp, ?loop_elapsed, ?remote_elapsed, ?diff_ms, buffer_depth=buffered_packets.len(), "recv packet");
-                    if !sink.is_paused() {
-                        decoder.push_packet(packet)?;
-                        if let Some(samples) = decoder.pop_samples()? {
-                            sink.push_samples(samples)?;
-                        }
+                trace!(len = packet.payload.num_bytes(), ts=?packet.timestamp, ?loop_elapsed, ?remote_elapsed, ?diff_ms, buffer_depth=buffered_packets.len(), "recv packet");
+                
+                // Warn if buffer is getting low (but still play)
+                if buffered_packets.len() < MIN_BUFFER_DEPTH {
+                    warn!("audio buffer running low: {} packets remaining", buffered_packets.len());
+                }
+                
+                if !sink.is_paused() {
+                    decoder.push_packet(packet)?;
+                    if let Some(samples) = decoder.pop_samples()? {
+                        sink.push_samples(samples)?;
                     }
                 }
             } else if started_playback {
-                // Buffer underrun - log and wait for more data
-                warn!("audio buffer underrun: {} packets remaining", buffered_packets.len());
-                std::thread::sleep(Duration::from_millis(50)); // Wait longer for buffer to refill
+                // Complete underrun - no packets available at all
+                warn!("audio buffer completely empty, waiting for packets");
+                std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
 
