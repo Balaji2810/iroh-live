@@ -295,3 +295,4 @@ impl VideoSource for CameraCapturer {
         Ok(Some(frame))
     }
 }
+
