@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::{HashMap, VecDeque}, sync::Arc, time::Duration};
 
 use hang::{
     Timestamp, TrackConsumer,
@@ -309,7 +309,7 @@ impl AudioTrack {
         span: Span,
     ) -> Result<Self> {
         let _guard = span.enter();
-        let (packet_tx, packet_rx) = mpsc::channel(32);
+        let (packet_tx, packet_rx) = mpsc::channel(250); // Increased for WAN jitter buffering (~2.5-5 seconds)
         let output_format = output.format()?;
         info!(?config, "audio thread start");
         let decoder = D::new(&config, output_format)?;
@@ -352,8 +352,13 @@ impl AudioTrack {
         shutdown: &CancellationToken,
     ) -> Result<()> {
         const INTERVAL: Duration = Duration::from_millis(10);
+        const INITIAL_BUFFER_MS: u64 = 300; // Wait for 300ms of buffer before starting
+        const MIN_BUFFER_DEPTH: usize = 10; // Maintain at least 10 packets (~100-200ms)
+        
         let mut remote_start = None;
         let loop_start = Instant::now();
+        let mut buffered_packets: VecDeque<hang::Frame> = VecDeque::new();
+        let mut started_playback = false;
 
         'outer: for i in 0.. {
             let tick = Instant::now();
@@ -363,38 +368,60 @@ impl AudioTrack {
                 break;
             }
 
+            // Receive and buffer all available packets
             loop {
                 match packet_rx.try_recv() {
                     Ok(packet) => {
-                        let remote_start = *remote_start.get_or_insert_with(|| packet.timestamp);
-
-                        let loop_elapsed = tick.duration_since(loop_start);
-                        let remote_elapsed: Duration = packet
-                            .timestamp
-                            .checked_sub(remote_start)
-                            .unwrap_or(Timestamp::ZERO)
-                            .into();
-                        let diff_ms =
-                            (loop_elapsed.as_secs_f32() - remote_elapsed.as_secs_f32()) * 1000.;
-
-                        // TODO: Skip outdated packets?
-                        trace!(len = packet.payload.num_bytes(), ts=?packet.timestamp, ?loop_elapsed, ?remote_elapsed, ?diff_ms, "recv packet");
-                        if !sink.is_paused() {
-                            decoder.push_packet(packet)?;
-                            if let Some(samples) = decoder.pop_samples()? {
-                                sink.push_samples(samples)?;
-                            }
-                        }
+                        buffered_packets.push_back(packet);
                     }
                     Err(TryRecvError::Disconnected) => {
                         debug!("stop audio thread: packet_rx disconnected");
                         break 'outer;
                     }
                     Err(TryRecvError::Empty) => {
-                        trace!("no packet to recv");
                         break;
                     }
                 }
+            }
+
+            // Wait for initial buffer before starting playback
+            if !started_playback {
+                if buffered_packets.len() >= (INITIAL_BUFFER_MS / 10) as usize {
+                    info!("audio jitter buffer filled ({} packets), starting playback", buffered_packets.len());
+                    started_playback = true;
+                } else {
+                    std::thread::sleep(INTERVAL);
+                    continue;
+                }
+            }
+
+            // Play packets if we have enough buffered
+            if buffered_packets.len() > MIN_BUFFER_DEPTH {
+                if let Some(packet) = buffered_packets.pop_front() {
+                    let remote_start = *remote_start.get_or_insert_with(|| packet.timestamp);
+
+                    let loop_elapsed = tick.duration_since(loop_start);
+                    let remote_elapsed: Duration = packet
+                        .timestamp
+                        .checked_sub(remote_start)
+                        .unwrap_or(Timestamp::ZERO)
+                        .into();
+                    let diff_ms =
+                        (loop_elapsed.as_secs_f32() - remote_elapsed.as_secs_f32()) * 1000.;
+
+                    trace!(len = packet.payload.num_bytes(), ts=?packet.timestamp, ?loop_elapsed, ?remote_elapsed, ?diff_ms, buffer_depth=buffered_packets.len(), "recv packet");
+                    if !sink.is_paused() {
+                        decoder.push_packet(packet)?;
+                        if let Some(samples) = decoder.pop_samples()? {
+                            sink.push_samples(samples)?;
+                        }
+                    }
+                }
+            } else if started_playback {
+                // Buffer underrun - log and wait for more data
+                warn!("audio buffer underrun: {} packets remaining", buffered_packets.len());
+                std::thread::sleep(Duration::from_millis(50)); // Wait longer for buffer to refill
+                continue;
             }
 
             let expected_time = i * INTERVAL;

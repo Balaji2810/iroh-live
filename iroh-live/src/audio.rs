@@ -446,7 +446,7 @@ impl AudioDriver {
                 sample_rate.try_into().unwrap(),
                 output_stream_sample_rate,
                 ResamplingChannelConfig {
-                    capacity_seconds: 3.,
+                    capacity_seconds: 5., // Increased for WAN connections
                     ..Default::default()
                 },
             )
