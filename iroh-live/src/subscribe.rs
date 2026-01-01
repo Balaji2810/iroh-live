@@ -404,7 +404,9 @@ impl AudioTrack {
             // Calculate network jitter from recent packet arrivals
             let jitter_ms = if packet_arrival_times.len() > 10 {
                 let mut intervals: Vec<f32> = Vec::new();
-                for window in packet_arrival_times.iter().as_slices().0.windows(2) {
+                let times: Vec<_> = packet_arrival_times.iter().collect();
+
+                for window in times.windows(2) {
                     let interval = window[1].0.duration_since(window[0].0).as_secs_f32() * 1000.0;
                     intervals.push(interval);
                 }
