@@ -15,7 +15,10 @@ mod processor {
     use anyhow::Result;
     use tracing::{debug, info};
     use webrtc_audio_processing::{
-        Config, EchoCancellation, EchoCancellationSuppressionLevel, InitializationConfig,
+        Config, EchoCancellation, EchoCancellationSuppressionLevel,
+        GainControl, GainControlMode, InitializationConfig,
+        NoiseSuppression, NoiseSuppressionLevel,
+        VoiceDetection, VoiceDetectionLikelihood,
     };
 
     #[derive(Debug, Clone)]
@@ -72,19 +75,37 @@ mod processor {
                     enable_extended_filter: true,
                 }),
                 enable_high_pass_filter: true,
+                
+                // Noise Suppression - Critical for clarity and removing background noise
+                noise_suppression: Some(NoiseSuppression {
+                    suppression_level: NoiseSuppressionLevel::VeryHigh,
+                }),
+                
+                // Automatic Gain Control for consistent volume and voice depth
+                gain_control: Some(GainControl {
+                    target_level_dbfs: 3,  // Target level in dB below full scale
+                    compression_gain_db: 9, // Amount of gain compression
+                    enable_limiter: true,   // Prevent clipping
+                    mode: GainControlMode::AdaptiveDigital,
+                }),
+                
+                // Voice Activity Detection - helps distinguish speech from noise
+                voice_detection: Some(VoiceDetection {
+                    likelihood: VoiceDetectionLikelihood::VeryLow,
+                }),
+                
                 ..Config::default()
             };
 
             let mut processor = webrtc_audio_processing::Processor::new(&InitializationConfig {
                 num_capture_channels: config.num_input_channels.get() as i32,
                 num_render_channels: config.num_output_channels.get() as i32,
-                enable_experimental_agc: true,
-                enable_intelligibility_enhancer: true, // ..InitializationConfig::default()
+                enable_experimental_agc: false, // Use configured AGC instead
+                enable_intelligibility_enhancer: true,
             })?;
             processor.set_config(processor_config.clone());
 
-            // processor.set_config(config.clone());
-            info!("init audio processor (config={config:?})");
+            info!("init audio processor with enhanced settings (NS=VeryHigh, AGC=AdaptiveDigital, VAD=enabled)");
             Ok(Self(Arc::new(Inner {
                 processor: Mutex::new(processor),
                 config: Mutex::new(processor_config),

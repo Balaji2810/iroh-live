@@ -446,7 +446,8 @@ impl AudioDriver {
                 sample_rate.try_into().unwrap(),
                 output_stream_sample_rate,
                 ResamplingChannelConfig {
-                    capacity_seconds: 5., // Increased for WAN connections
+                    capacity_seconds: 5.0,   // Good buffer for WAN connections
+                    latency_seconds: 0.1,    // Target 100ms latency for smooth playback
                     ..Default::default()
                 },
             )
@@ -506,7 +507,8 @@ impl AudioDriver {
                 sample_rate.try_into().unwrap(),
                 input_stream_sample_rate,
                 ResamplingChannelConfig {
-                    capacity_seconds: 3.0,
+                    capacity_seconds: 3.0,   // Adequate buffer for input stream
+                    latency_seconds: 0.05,   // Lower latency for capture (50ms)
                     ..Default::default()
                 },
             )
