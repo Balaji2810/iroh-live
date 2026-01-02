@@ -105,7 +105,7 @@ impl H264Encoder {
         // Bitrate heuristic (from your original)
         let pixels = width * height;
         let framerate_factor = 30.0 + (framerate as f32 - 30.) / 2.;
-        let bitrate = (pixels as f32 * 0.07 * framerate_factor).round() as u64;
+        let bitrate = (pixels as f32 * 0.5 * framerate_factor).round() as u64;
 
         let opts = EncoderOpts {
             width,

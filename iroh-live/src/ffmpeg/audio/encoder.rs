@@ -9,7 +9,7 @@ use crate::{
 };
 
 const SAMPLE_RATE: u32 = 48_000;
-const BITRATE: u64 = 192_000; // 128 kbps
+const BITRATE: u64 = 320_000; // 128 kbps
 
 pub struct OpusEncoder {
     encoder: ffmpeg::encoder::Audio,
