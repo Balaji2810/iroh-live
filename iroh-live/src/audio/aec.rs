@@ -76,9 +76,10 @@ mod processor {
                 }),
                 enable_high_pass_filter: true,
                 
-                // Noise Suppression - Critical for clarity and removing background noise
+                // Noise Suppression - Balanced for clarity and performance
+                // Reduced from VeryHigh to High to prevent >10ms processing delays
                 noise_suppression: Some(NoiseSuppression {
-                    suppression_level: NoiseSuppressionLevel::VeryHigh,
+                    suppression_level: NoiseSuppressionLevel::High,
                 }),
                 
                 // Automatic Gain Control for consistent volume and voice depth
@@ -105,7 +106,7 @@ mod processor {
             })?;
             processor.set_config(processor_config.clone());
 
-            info!("init audio processor with enhanced settings (NS=VeryHigh, AGC=AdaptiveDigital, VAD=enabled)");
+            info!("init audio processor with balanced settings (NS=High, AGC=AdaptiveDigital, VAD=enabled)");
             Ok(Self(Arc::new(Inner {
                 processor: Mutex::new(processor),
                 config: Mutex::new(processor_config),

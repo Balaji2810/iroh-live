@@ -309,7 +309,7 @@ impl AudioTrack {
         span: Span,
     ) -> Result<Self> {
         let _guard = span.enter();
-        let (packet_tx, packet_rx) = mpsc::channel(250); // Increased for WAN jitter buffering (~2.5-5 seconds)
+        let (packet_tx, packet_rx) = mpsc::channel(500); // Increased capacity to prevent backpressure (~5 seconds at 10ms intervals)
         let output_format = output.format()?;
         info!(?config, "audio thread start");
         let decoder = D::new(&config, output_format)?;
@@ -367,6 +367,10 @@ impl AudioTrack {
         let mut packet_arrival_times: VecDeque<(Instant, u64)> = VecDeque::with_capacity(JITTER_WINDOW_SIZE);
         let mut underrun_count = 0u32;
         let mut target_buffer_size = TARGET_BUFFER_DEPTH;
+        
+        // Timing drift tracking
+        let mut drift_accumulator = Duration::ZERO;
+        let mut consecutive_slow_ticks = 0u32;
 
         'outer: for i in 0.. {
             let tick = Instant::now();
@@ -486,9 +490,21 @@ impl AudioTrack {
                 }
 
                 if !sink.is_paused() {
+                    let decode_start = Instant::now();
                     decoder.push_packet(packet)?;
                     if let Some(samples) = decoder.pop_samples()? {
                         sink.push_samples(samples)?;
+                    }
+                    let decode_time = decode_start.elapsed();
+                    
+                    // Warn if decode takes too long (approaching 10ms interval)
+                    if decode_time > Duration::from_millis(8) {
+                        consecutive_slow_ticks += 1;
+                        if consecutive_slow_ticks % 10 == 0 {
+                            warn!("slow decode detected: {:?} (consecutive: {})", decode_time, consecutive_slow_ticks);
+                        }
+                    } else {
+                        consecutive_slow_ticks = 0;
                     }
                 }
             } else if started_playback {
@@ -508,9 +524,29 @@ impl AudioTrack {
 
             let expected_time = i * INTERVAL;
             let real_time = Instant::now().duration_since(loop_start);
+            let drift = real_time.saturating_sub(expected_time);
+            drift_accumulator += drift;
+            
+            // Detect significant timing drift and log periodically
+            if drift > Duration::from_millis(5) && i % 100 == 0 {
+                warn!("audio loop timing drift: {:?} (accumulated: {:?})", drift, drift_accumulator);
+            }
+            
+            // Calculate sleep time with drift correction
             let sleep = expected_time.saturating_sub(real_time);
             if !sleep.is_zero() {
-                std::thread::sleep(sleep);
+                // On Windows, sleep precision is poor (~15ms), so we use a more aggressive approach
+                // for small sleep times to reduce drift accumulation
+                if sleep < Duration::from_millis(5) {
+                    // For very short sleeps, use yield instead to reduce overhead
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(sleep);
+                }
+            } else if drift > Duration::from_millis(20) {
+                // If we're significantly behind, skip a tick to catch up
+                warn!("audio loop significantly behind ({:?}), skipping tick to catch up", drift);
+                drift_accumulator = drift_accumulator.saturating_sub(INTERVAL);
             }
         }
         shutdown.cancel();
@@ -764,15 +800,34 @@ impl WatchTrack {
 }
 
 async fn forward_frames(mut track: hang::TrackConsumer, sender: mpsc::Sender<hang::Frame>) {
+    let mut frames_sent = 0u64;
+    let mut send_start = Instant::now();
+    
     loop {
         let frame = track.read_frame().await;
         match frame {
             Ok(Some(frame)) => {
+                // Track send time to detect backpressure (blocking sends take longer)
+                let send_time = Instant::now();
                 if sender.send(frame).await.is_err() {
+                    debug!("audio packet channel closed, stopping forward_frames");
                     break;
                 }
+                let send_duration = send_time.elapsed();
+                
+                // If send took >1ms, channel is likely full (backpressure)
+                if send_duration > Duration::from_millis(1) {
+                    warn!("audio packet channel backpressure detected: send took {:?} (frames sent: {})", 
+                          send_duration, frames_sent);
+                }
+                
+                frames_sent += 1;
             }
-            Ok(None) => break,
+            Ok(None) => {
+                debug!("audio track ended, forwarded {} frames in {:?}", 
+                      frames_sent, send_start.elapsed());
+                break;
+            }
             Err(err) => {
                 warn!("failed to read frame: {err:?}");
                 break;
