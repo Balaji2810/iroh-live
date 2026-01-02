@@ -91,7 +91,7 @@ mod processor {
                 
                 // Voice Activity Detection - helps distinguish speech from noise
                 voice_detection: Some(VoiceDetection {
-                    likelihood: VoiceDetectionLikelihood::VeryLow,
+                    detection_likelihood: VoiceDetectionLikelihood::VeryLow,
                 }),
                 
                 ..Config::default()
