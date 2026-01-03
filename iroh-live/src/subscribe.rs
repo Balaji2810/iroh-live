@@ -309,7 +309,7 @@ impl AudioTrack {
         span: Span,
     ) -> Result<Self> {
         let _guard = span.enter();
-        let (packet_tx, packet_rx) = mpsc::channel(250); // Increased capacity to prevent backpressure (~5 seconds at 10ms intervals)
+        let (packet_tx, packet_rx) = mpsc::channel(400); // Adequate capacity for network jitter (~2.5 seconds at 10ms intervals)
         let output_format = output.format()?;
         info!(?config, "audio thread start");
         let decoder = D::new(&config, output_format)?;
@@ -352,9 +352,9 @@ impl AudioTrack {
         shutdown: &CancellationToken,
     ) -> Result<()> {
         const INTERVAL: Duration = Duration::from_millis(10);
-        const INITIAL_BUFFER_MS: u64 = 500; // Increased initial buffer for WAN stability
-        const MIN_BUFFER_DEPTH: usize = 10; // Minimum buffer before warning
-        const TARGET_BUFFER_DEPTH: usize = 20; // Target buffer size (200ms)
+        const INITIAL_BUFFER_MS: u64 = 100; // Initial buffer before playback starts (200ms)
+        const MIN_BUFFER_DEPTH: usize = 15; // Minimum buffer before warning
+        const TARGET_BUFFER_DEPTH: usize = 30; // Target buffer size (200ms) - adaptive logic will increase if needed
         const MAX_BUFFER_DEPTH: usize = 50; // Maximum buffer before draining
         const JITTER_WINDOW_SIZE: usize = 100; // Number of packets to track for jitter calculation
 
@@ -367,9 +367,6 @@ impl AudioTrack {
         let mut packet_arrival_times: VecDeque<(Instant, u64)> = VecDeque::with_capacity(JITTER_WINDOW_SIZE);
         let mut underrun_count = 0u32;
         let mut target_buffer_size = TARGET_BUFFER_DEPTH;
-        
-        // Timing drift tracking
-        let mut drift_accumulator = Duration::ZERO;
         let mut consecutive_slow_ticks = 0u32;
 
         'outer: for i in 0.. {
@@ -513,8 +510,8 @@ impl AudioTrack {
                 warn!("audio buffer underrun #{}, waiting for packets (target buffer: {})",
                       underrun_count, target_buffer_size);
 
-                // Increase target buffer after underrun to prevent future occurrences
-                target_buffer_size = (target_buffer_size + 10).min(MAX_BUFFER_DEPTH);
+                // Increase target buffer after underrun to prevent future occurrences (more conservative)
+                target_buffer_size = (target_buffer_size + 5).min(MAX_BUFFER_DEPTH);
 
                 // Reset playback to rebuild buffer
                 started_playback = false;
@@ -522,31 +519,31 @@ impl AudioTrack {
                 continue;
             }
 
-            let expected_time = i * INTERVAL;
+            let expected_time = (i + 1) * INTERVAL;
             let real_time = Instant::now().duration_since(loop_start);
-            let drift = real_time.saturating_sub(expected_time);
-            drift_accumulator += drift;
-            
-            // Detect significant timing drift and log periodically
-            if drift > Duration::from_millis(5) && i % 100 == 0 {
-                warn!("audio loop timing drift: {:?} (accumulated: {:?})", drift, drift_accumulator);
-            }
-            
-            // Calculate sleep time with drift correction
-            let sleep = expected_time.saturating_sub(real_time);
-            if !sleep.is_zero() {
-                // On Windows, sleep precision is poor (~15ms), so we use a more aggressive approach
-                // for small sleep times to reduce drift accumulation
-                if sleep < Duration::from_millis(5) {
-                    // For very short sleeps, use yield instead to reduce overhead
+            let sleep_time = expected_time.saturating_sub(real_time);
+
+            // On Windows, thread::sleep has ~15.6ms precision, which causes significant drift
+            // for 10ms intervals. We use busy-waiting for the final 2ms to improve accuracy.
+            if sleep_time > Duration::from_millis(2) {
+                // Sleep for most of the duration
+                std::thread::sleep(sleep_time - Duration::from_millis(2));
+
+                // Busy-wait for the remainder to hit precise timing
+                let target = loop_start + expected_time;
+                while Instant::now() < target {
                     std::thread::yield_now();
-                } else {
-                    std::thread::sleep(sleep);
                 }
-            } else if drift > Duration::from_millis(20) {
-                // If we're significantly behind, skip a tick to catch up
-                warn!("audio loop significantly behind ({:?}), skipping tick to catch up", drift);
-                drift_accumulator = drift_accumulator.saturating_sub(INTERVAL);
+            } else if !sleep_time.is_zero() {
+                // For very short sleeps, just busy-wait
+                let target = loop_start + expected_time;
+                while Instant::now() < target {
+                    std::thread::yield_now();
+                }
+            } else if real_time.saturating_sub(expected_time) > Duration::from_millis(20) {
+                // If we're significantly behind, skip ahead (this happens after underruns)
+                warn!("audio loop significantly behind ({:?}), skipping tick to catch up",
+                      real_time.saturating_sub(expected_time));
             }
         }
         shutdown.cancel();

@@ -508,7 +508,7 @@ impl AudioDriver {
                 input_stream_sample_rate,
                 ResamplingChannelConfig {
                     capacity_seconds: 3.0,   // Adequate buffer for input stream
-                    latency_seconds: 0.05,   // Lower latency for capture (50ms)
+                    latency_seconds: 0.08,   // Lower latency for capture (50ms)
                     ..Default::default()
                 },
             )
