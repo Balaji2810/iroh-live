@@ -34,6 +34,7 @@ use crate::{
 };
 
 mod aec;
+pub mod adaptive;
 
 type StreamWriterHandle = Arc<Mutex<StreamWriterState>>;
 type StreamReaderHandle = Arc<Mutex<StreamReaderState>>;
@@ -309,12 +310,12 @@ impl AudioDriver {
                 // if let UpdateError::StreamStoppedUnexpectedly(_) = e {
                 //     // Notify the stream node handles that the output stream has stopped.
                 //     // This will automatically stop any active streams on the nodes.
-                //     cx.node_state_mut::<StreamWriterState>(stream_writer_id)
-                //         .unwrap()
-                //         .stop_stream();
-                //     cx.node_state_mut::<StreamReaderState>(stream_reader_id)
-                //         .unwrap()
-                //         .stop_stream();
+                //     // cx.node_state_mut::<StreamWriterState>(stream_writer_id)
+                //     //     .unwrap()
+                //     //     .stop_stream();
+                //     // cx.node_state_mut::<StreamReaderState>(stream_reader_id)
+                //     //     .unwrap()
+                //     //     .stop_stream();
 
                 //     // The stream has stopped unexpectedly (i.e the user has
                 //     // unplugged their headphones.)
@@ -613,3 +614,4 @@ impl AudioBackend {
         Ok(handle)
     }
 }
+

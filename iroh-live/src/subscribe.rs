@@ -351,50 +351,50 @@ impl AudioTrack {
         mut sink: impl AudioSink,
         shutdown: &CancellationToken,
     ) -> Result<()> {
+        use crate::audio::adaptive::AdaptiveJitterBuffer;
+
         const INTERVAL: Duration = Duration::from_millis(10);
-        const INITIAL_BUFFER_MS: u64 = 100; // Initial buffer before playback starts (200ms)
-        const MIN_BUFFER_DEPTH: usize = 15; // Minimum buffer before warning
-        const TARGET_BUFFER_DEPTH: usize = 30; // Target buffer size (200ms) - adaptive logic will increase if needed
-        const MAX_BUFFER_DEPTH: usize = 50; // Maximum buffer before draining
-        const JITTER_WINDOW_SIZE: usize = 100; // Number of packets to track for jitter calculation
+        const INITIAL_BUFFER_MS: u32 = 60; // Initial target: 60ms for low latency
+        const FRAME_DURATION_MS: u32 = 20; // Typical Opus frame duration
 
-        let mut remote_start = None;
+        info!(
+            "audio decoder loop starting with adaptive jitter buffer (target={}ms)",
+            INITIAL_BUFFER_MS
+        );
+
+        // Create adaptive jitter buffer
+        let mut jitter_buffer = AdaptiveJitterBuffer::new(INITIAL_BUFFER_MS, FRAME_DURATION_MS);
+        
+        // Timing management with drift recovery
         let loop_start = Instant::now();
-        let mut buffered_packets: VecDeque<hang::Frame> = VecDeque::new();
-        let mut started_playback = false;
-
-        // Adaptive buffering state
-        let mut packet_arrival_times: VecDeque<(Instant, u64)> = VecDeque::with_capacity(JITTER_WINDOW_SIZE);
-        let mut underrun_count = 0u32;
-        let mut target_buffer_size = TARGET_BUFFER_DEPTH;
+        let mut timing_baseline = loop_start;
+        let mut tick_count = 0u64;
         let mut consecutive_slow_ticks = 0u32;
 
-        'outer: for i in 0.. {
+        loop {
             let tick = Instant::now();
 
             if shutdown.is_cancelled() {
                 debug!("stop audio thread: cancelled");
+                jitter_buffer.stats().log_summary();
                 break;
             }
 
-            // Receive and buffer all available packets with arrival time tracking
+            // Receive all available packets and add to jitter buffer
             loop {
                 match packet_rx.try_recv() {
                     Ok(packet) => {
-                        let arrival_time = Instant::now();
-                        let packet_seq = buffered_packets.len() as u64;
-
-                        // Track packet arrival for jitter calculation
-                        packet_arrival_times.push_back((arrival_time, packet_seq));
-                        if packet_arrival_times.len() > JITTER_WINDOW_SIZE {
-                            packet_arrival_times.pop_front();
+                        // Decode packet immediately to get samples
+                        decoder.push_packet(packet)?;
+                        if let Some(samples) = decoder.pop_samples()? {
+                            // Insert decoded samples into jitter buffer
+                            jitter_buffer.insert(samples.to_vec());
                         }
-
-                        buffered_packets.push_back(packet);
                     }
                     Err(TryRecvError::Disconnected) => {
                         debug!("stop audio thread: packet_rx disconnected");
-                        break 'outer;
+                        jitter_buffer.stats().log_summary();
+                        return Ok(());
                     }
                     Err(TryRecvError::Empty) => {
                         break;
@@ -402,150 +402,78 @@ impl AudioTrack {
                 }
             }
 
-            // Calculate network jitter from recent packet arrivals
-            let jitter_ms = if packet_arrival_times.len() > 10 {
-                let mut intervals: Vec<f32> = Vec::new();
-                let times: Vec<_> = packet_arrival_times.iter().collect();
+            // Get audio from jitter buffer for playback
+            if !sink.is_paused() {
+                // Get format to determine frame size
+                let format = sink.format()?;
+                // Calculate frame size for 10ms (INTERVAL)
+                let frame_size = (format.sample_rate / 100) as usize * format.channel_count as usize;
 
-                for window in times.windows(2) {
-                    let interval = window[1].0.duration_since(window[0].0).as_secs_f32() * 1000.0;
-                    intervals.push(interval);
-                }
-
-                if !intervals.is_empty() {
-                    let mean: f32 = intervals.iter().sum::<f32>() / intervals.len() as f32;
-                    let variance: f32 = intervals.iter()
-                        .map(|x| (x - mean).powi(2))
-                        .sum::<f32>() / intervals.len() as f32;
-                    variance.sqrt()
-                } else {
-                    0.0
-                }
-            } else {
-                0.0
-            };
-
-            // Adaptive buffer adjustment based on jitter
-            if jitter_ms > 15.0 {
-                // High jitter detected - increase target buffer
-                target_buffer_size = (target_buffer_size + 5).min(MAX_BUFFER_DEPTH);
-                trace!("high jitter detected ({:.2}ms), increasing target buffer to {}", jitter_ms, target_buffer_size);
-            } else if jitter_ms < 5.0 && target_buffer_size > MIN_BUFFER_DEPTH {
-                // Low jitter - can reduce buffer gradually
-                target_buffer_size = (target_buffer_size.saturating_sub(1)).max(MIN_BUFFER_DEPTH);
-            }
-
-            // Wait for initial buffer before starting playback
-            if !started_playback {
-                if buffered_packets.len() >= (INITIAL_BUFFER_MS / 10) as usize {
-                    info!("audio jitter buffer filled ({} packets), starting playback", buffered_packets.len());
-                    started_playback = true;
-                } else {
-                    std::thread::sleep(INTERVAL);
-                    continue;
-                }
-            }
-
-            // Adaptive buffer management - drain excess if buffer is too large
-            if buffered_packets.len() > MAX_BUFFER_DEPTH {
-                let excess = buffered_packets.len() - target_buffer_size;
-                warn!("audio buffer overflow ({} packets), draining {} packets", buffered_packets.len(), excess);
-                for _ in 0..excess {
-                    buffered_packets.pop_front();
-                }
-            }
-
-            // Play packet if we have any buffered (after initial startup)
-            if let Some(packet) = buffered_packets.pop_front() {
-                let remote_start = *remote_start.get_or_insert_with(|| packet.timestamp);
-
-                let loop_elapsed = tick.duration_since(loop_start);
-                let remote_elapsed: Duration = packet
-                    .timestamp
-                    .checked_sub(remote_start)
-                    .unwrap_or(Timestamp::ZERO)
-                    .into();
-                let diff_ms =
-                    (loop_elapsed.as_secs_f32() - remote_elapsed.as_secs_f32()) * 1000.;
-
-                trace!(
-                    len = packet.payload.num_bytes(),
-                    ts=?packet.timestamp,
-                    ?loop_elapsed,
-                    ?remote_elapsed,
-                    ?diff_ms,
-                    buffer_depth=buffered_packets.len(),
-                    target_buffer=target_buffer_size,
-                    jitter_ms=?jitter_ms,
-                    "recv packet"
-                );
-
-                // Warn if buffer is getting low (but still play)
-                if buffered_packets.len() < MIN_BUFFER_DEPTH {
-                    warn!("audio buffer running low: {} packets remaining (target: {})",
-                          buffered_packets.len(), target_buffer_size);
-                }
-
-                if !sink.is_paused() {
-                    let decode_start = Instant::now();
-                    decoder.push_packet(packet)?;
-                    if let Some(samples) = decoder.pop_samples()? {
-                        sink.push_samples(samples)?;
-                    }
+                let decode_start = Instant::now();
+                if let Some(samples) = jitter_buffer.get_audio(frame_size) {
+                    sink.push_samples(&samples)?;
+                    
                     let decode_time = decode_start.elapsed();
                     
-                    // Warn if decode takes too long (approaching 10ms interval)
+                    // Warn if processing takes too long
                     if decode_time > Duration::from_millis(8) {
                         consecutive_slow_ticks += 1;
                         if consecutive_slow_ticks % 10 == 0 {
-                            warn!("slow decode detected: {:?} (consecutive: {})", decode_time, consecutive_slow_ticks);
+                            warn!(
+                                "slow audio processing: {:?} (consecutive: {})",
+                                decode_time, consecutive_slow_ticks
+                            );
                         }
                     } else {
                         consecutive_slow_ticks = 0;
                     }
                 }
-            } else if started_playback {
-                // Complete underrun - no packets available at all
-                underrun_count += 1;
-                warn!("audio buffer underrun #{}, waiting for packets (target buffer: {})",
-                      underrun_count, target_buffer_size);
 
-                // Increase target buffer after underrun to prevent future occurrences (more conservative)
-                target_buffer_size = (target_buffer_size + 5).min(MAX_BUFFER_DEPTH);
-
-                // Reset playback to rebuild buffer
-                started_playback = false;
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
+                // Periodic stats logging
+                if tick_count % 1000 == 0 && tick_count > 0 {
+                    trace!(
+                        "jitter buffer: depth={}/{}, jitter={:.1}ms",
+                        jitter_buffer.buffer_depth(),
+                        jitter_buffer.target_size(),
+                        jitter_buffer.jitter_ms()
+                    );
+                }
             }
 
-            let expected_time = (i + 1) * INTERVAL;
-            let real_time = Instant::now().duration_since(loop_start);
+            // Precise timing loop with drift recovery
+            tick_count += 1;
+            let expected_time = Duration::from_millis(tick_count * 10);
+            let real_time = Instant::now().duration_since(timing_baseline);
+            
+            // Check for significant timing drift and reset baseline if needed
+            let drift = real_time.saturating_sub(expected_time);
+            if drift > Duration::from_millis(50) {
+                warn!("audio loop drifted behind by {:?}, resetting timing baseline", drift);
+                timing_baseline = Instant::now();
+                tick_count = 0;
+                continue;
+            }
+            
             let sleep_time = expected_time.saturating_sub(real_time);
 
-            // On Windows, thread::sleep has ~15.6ms precision, which causes significant drift
-            // for 10ms intervals. We use busy-waiting for the final 2ms to improve accuracy.
+            // Hybrid sleep: coarse sleep + fine busy-wait for Windows precision
             if sleep_time > Duration::from_millis(2) {
-                // Sleep for most of the duration
                 std::thread::sleep(sleep_time - Duration::from_millis(2));
-
+                
                 // Busy-wait for the remainder to hit precise timing
-                let target = loop_start + expected_time;
+                let target = timing_baseline + expected_time;
                 while Instant::now() < target {
                     std::thread::yield_now();
                 }
             } else if !sleep_time.is_zero() {
                 // For very short sleeps, just busy-wait
-                let target = loop_start + expected_time;
+                let target = timing_baseline + expected_time;
                 while Instant::now() < target {
                     std::thread::yield_now();
                 }
-            } else if real_time.saturating_sub(expected_time) > Duration::from_millis(20) {
-                // If we're significantly behind, skip ahead (this happens after underruns)
-                warn!("audio loop significantly behind ({:?}), skipping tick to catch up",
-                      real_time.saturating_sub(expected_time));
             }
         }
+
         shutdown.cancel();
         Ok(())
     }

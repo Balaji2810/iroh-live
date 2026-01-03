@@ -42,6 +42,8 @@ xcap = "0.8"
 bytes = "1.11.0"
 iroh-smol-kv = { git = "https://github.com/Frando/iroh-smol-kv", branch = "iroh-095", version = "0.3.1", default-features = false }
 buf-list = "1.1.2"
+neteq = "0.8.0"
+rubato = "1.0.0-preview.0"
 
 
 [dev-dependencies]
