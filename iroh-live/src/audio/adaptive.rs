@@ -3,12 +3,9 @@
 // This module provides an adaptive jitter buffer with packet loss concealment
 // for smooth audio playback over networks with varying jitter and packet loss.
 
-use std::{collections::VecDeque, time::{Duration, Instant}};
+use std::{collections::VecDeque, time::Instant};
 
-use anyhow::{Context, Result};
-use tracing::{debug, info, trace, warn};
-
-use crate::av::AudioFormat;
+use tracing::{info, trace, warn};
 
 /// Adaptive audio jitter buffer with dynamic buffer sizing
 ///
@@ -47,6 +44,7 @@ struct AudioFrame {
     /// Audio samples (interleaved)
     samples: Vec<f32>,
     /// Timestamp when received
+    #[allow(dead_code)]
     received_at: Instant,
 }
 

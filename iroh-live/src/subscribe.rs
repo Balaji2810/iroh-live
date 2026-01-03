@@ -1,7 +1,7 @@
-use std::{collections::{HashMap, VecDeque}, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use hang::{
-    Timestamp, TrackConsumer,
+    TrackConsumer,
     catalog::{AudioConfig, Catalog, CatalogConsumer, VideoConfig},
 };
 use moq_lite::{BroadcastConsumer, Track};
@@ -353,7 +353,6 @@ impl AudioTrack {
     ) -> Result<()> {
         use crate::audio::adaptive::AdaptiveJitterBuffer;
 
-        const INTERVAL: Duration = Duration::from_millis(10);
         const INITIAL_BUFFER_MS: u32 = 150; // Initial target: 150ms for stable playback
         const FRAME_DURATION_MS: u32 = 20; // Typical Opus frame duration
 
@@ -372,7 +371,7 @@ impl AudioTrack {
         let mut consecutive_slow_ticks = 0u32;
 
         loop {
-            let tick = Instant::now();
+            let _tick = Instant::now();
 
             if shutdown.is_cancelled() {
                 debug!("stop audio thread: cancelled");
@@ -726,7 +725,7 @@ impl WatchTrack {
 
 async fn forward_frames(mut track: hang::TrackConsumer, sender: mpsc::Sender<hang::Frame>) {
     let mut frames_sent = 0u64;
-    let mut send_start = Instant::now();
+    let send_start = Instant::now();
     
     loop {
         let frame = track.read_frame().await;

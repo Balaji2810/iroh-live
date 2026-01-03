@@ -44,6 +44,7 @@ iroh-smol-kv = { git = "https://github.com/Frando/iroh-smol-kv", branch = "iroh-
 buf-list = "1.1.2"
 neteq = "0.8.0"
 rubato = "1.0.0-preview.0"
+goog_cc = "0.1.4"
 
 
 [dev-dependencies]

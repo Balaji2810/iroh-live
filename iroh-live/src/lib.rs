@@ -3,6 +3,7 @@ pub mod av;
 pub mod capture;
 pub mod ffmpeg;
 mod live;
+pub mod network;
 mod node;
 pub mod publish;
 pub mod rooms;

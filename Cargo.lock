@@ -3137,6 +3137,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "goog_cc"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28400404562baaf6e5a31428d0a29842d7247ca873eb0748ceef6fddfb9637d2"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "gpu-alloc"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3905,6 +3914,7 @@ dependencies = [
  "ffmpeg-next",
  "ffmpeg-sys-next",
  "firewheel",
+ "goog_cc",
  "hang",
  "image",
  "iroh",

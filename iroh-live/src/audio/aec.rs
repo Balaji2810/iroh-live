@@ -18,7 +18,6 @@ mod processor {
         Config, EchoCancellation, EchoCancellationSuppressionLevel,
         GainControl, GainControlMode, InitializationConfig,
         NoiseSuppression, NoiseSuppressionLevel,
-        VoiceDetection, VoiceDetectionLikelihood,
     };
 
     #[derive(Debug, Clone)]

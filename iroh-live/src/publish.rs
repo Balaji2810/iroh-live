@@ -289,6 +289,7 @@ pub struct VideoRenditions {
     make_encoder: Box<dyn Fn(VideoPreset) -> Result<Box<dyn VideoEncoder>> + Send>,
     source: SharedVideoSource,
     renditions: HashMap<String, VideoPreset>,
+    #[allow(dead_code)]
     source_dimensions: (u32, u32),
     _shared_source_cancel_guard: DropGuard,
 }
