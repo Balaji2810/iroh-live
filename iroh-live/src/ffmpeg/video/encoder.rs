@@ -102,10 +102,15 @@ impl H264Encoder {
         info!("Initializing H264 encoder: {width}x{height} @ {framerate}fps");
         ffmpeg::init()?;
 
-        // Bitrate heuristic (from your original)
+        // Bitrate heuristic - quality-focused for modern networks
         let pixels = width * height;
         let framerate_factor = 30.0 + (framerate as f32 - 30.) / 2.;
-        let bitrate = (pixels as f32 * 0.2 * framerate_factor).round() as u64;
+        
+        // Increased multiplier: 0.2 -> 0.3 for better quality
+        // For 1080p @ 30fps: ~18 Mbps (was ~12 Mbps)
+        // For 720p @ 30fps: ~8 Mbps (was ~5 Mbps)
+        // For 360p @ 30fps: ~2 Mbps (was ~1.4 Mbps)
+        let bitrate = (pixels as f32 * 0.3 * framerate_factor).round() as u64;
 
         let opts = EncoderOpts {
             width,
