@@ -79,7 +79,7 @@ mod processor {
                 // Noise Suppression - Balanced for clarity and performance
                 // Reduced from VeryHigh to High to prevent >10ms processing delays
                 noise_suppression: Some(NoiseSuppression {
-                    suppression_level: NoiseSuppressionLevel::High,
+                    suppression_level: NoiseSuppressionLevel::VeryHigh,
                 }),
                 
                 // Automatic Gain Control for consistent volume and voice depth
@@ -106,7 +106,7 @@ mod processor {
             })?;
             processor.set_config(processor_config.clone());
 
-            info!("init audio processor with balanced settings (NS=High, AGC=AdaptiveDigital, VAD=enabled)");
+            info!("init audio processor with balanced settings (NS=VeryHigh, AGC=AdaptiveDigital, VAD=enabled)");
             Ok(Self(Arc::new(Inner {
                 processor: Mutex::new(processor),
                 config: Mutex::new(processor_config),
