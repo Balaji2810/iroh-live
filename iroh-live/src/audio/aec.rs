@@ -85,15 +85,15 @@ mod processor {
                 // Automatic Gain Control for consistent volume and voice depth
                 gain_control: Some(GainControl {
                     target_level_dbfs: 3,  // Target level in dB below full scale
-                    compression_gain_db: 9, // Amount of gain compression
+                    compression_gain_db: 6, // Amount of gain compression
                     enable_limiter: true,   // Prevent clipping
                     mode: GainControlMode::AdaptiveDigital,
                 }),
                 
                 // Voice Activity Detection - helps distinguish speech from noise
-                voice_detection: Some(VoiceDetection {
-                    detection_likelihood: VoiceDetectionLikelihood::VeryLow,
-                }),
+                // voice_detection: Some(VoiceDetection {
+                //     detection_likelihood: VoiceDetectionLikelihood::VeryLow,
+                // }),
                 
                 ..Config::default()
             };
