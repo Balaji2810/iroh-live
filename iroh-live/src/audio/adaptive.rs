@@ -64,7 +64,7 @@ impl AdaptiveJitterBuffer {
     /// * `frame_duration_ms` - Duration of each audio frame in milliseconds (e.g., 20ms for Opus)
     pub fn new(initial_target_ms: u32, frame_duration_ms: u32) -> Self {
         let target_frames = (initial_target_ms / frame_duration_ms).max(5) as usize;
-        let min_frames = (target_frames / 2).max(3); // At least 3 frames before playback
+        let min_frames = (target_frames / 2).max(6); // Increased from 3 to 6 for WAN stability
         let max_frames = target_frames * 3; // Triple target as maximum
 
         info!(
@@ -195,8 +195,8 @@ impl AdaptiveJitterBuffer {
                 // Underrun - no more frames available
                 self.stats.underruns += 1;
                 
-                // Only log every 10th underrun to avoid spam
-                if self.stats.underruns % 10 == 1 {
+                // Only log every 20th underrun to avoid spam
+                if self.stats.underruns % 20 == 1 {
                     warn!(
                         "jitter buffer underrun #{} - filling with silence ({} samples short)",
                         self.stats.underruns,
@@ -204,8 +204,8 @@ impl AdaptiveJitterBuffer {
                     );
                 }
                 
-                // Increase target buffer size to prevent future underruns
-                self.target_buffer_size = (self.target_buffer_size + 2).min(self.max_buffer_size);
+                // Aggressively increase target buffer size to prevent future underruns
+                self.target_buffer_size = (self.target_buffer_size + 4).min(self.max_buffer_size);
                 self.stable_ticks = 0;
 
                 // Fill remaining with silence
@@ -228,8 +228,9 @@ impl AdaptiveJitterBuffer {
         let buffer_depth = self.buffer.len();
 
         // FAST reaction to problems: increase buffer immediately
-        if current_jitter > 25.0 || buffer_depth < self.min_buffer_size {
-            self.target_buffer_size = (self.target_buffer_size + 2).min(self.max_buffer_size);
+        // More aggressive thresholds for WAN connections
+        if current_jitter > 20.0 || buffer_depth < self.min_buffer_size {
+            self.target_buffer_size = (self.target_buffer_size + 3).min(self.max_buffer_size);
             self.stable_ticks = 0;
             trace!(
                 "jitter buffer: increasing target to {} (jitter={:.1}ms, depth={})",
@@ -239,11 +240,11 @@ impl AdaptiveJitterBuffer {
             );
         }
         // SLOW reaction to good conditions: reduce only after sustained stability
-        else if current_jitter < 10.0 && buffer_depth > self.target_buffer_size + 3 {
+        else if current_jitter < 8.0 && buffer_depth > self.target_buffer_size + 5 {
             self.stable_ticks += 1;
             
-            // Only reduce after 3 seconds of stability (assuming 10ms ticks = 300 ticks)
-            if self.stable_ticks > 300 && self.target_buffer_size > self.min_buffer_size {
+            // Only reduce after 5 seconds of stability (assuming 10ms ticks = 500 ticks)
+            if self.stable_ticks > 500 && self.target_buffer_size > self.min_buffer_size {
                 self.target_buffer_size = self.target_buffer_size.saturating_sub(1);
                 self.stable_ticks = 0;
                 trace!(

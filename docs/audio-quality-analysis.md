@@ -122,6 +122,46 @@ Current timing uses `thread::sleep` which is unreliable. Consider:
 
 ---
 
+## ✅ FIXES APPLIED (2026-01-03)
+
+### Changes Made to Audio Jitter Buffer
+
+**1. Increased Buffer Sizes for WAN Stability**
+- `INITIAL_BUFFER_MS`: 150ms → **250ms** (+67%)
+- `MIN_BUFFER_FRAMES`: 3 → **6 frames** (+100%)
+- Result: ~120ms minimum buffer (6 × 20ms frames) before playback
+- Benefit: Dramatically reduces underruns on high-latency connections
+
+**2. Improved Adaptive Growth Strategy**
+- **Faster recovery**: Underruns trigger +4 frame increase (was +2)
+- **Earlier detection**: React to jitter >20ms (was >25ms)  
+- **Conservative shrink**: Requires 5 seconds stability (was 3 seconds)
+- **Tighter thresholds**: Only reduce when jitter <8ms (was <10ms)
+
+**3. Reduced Log Verbosity**
+- Underrun logging: Every 20th occurrence (was every 10th)
+- Keeps logs readable while maintaining visibility
+
+### Expected Improvements
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| Initial Buffer | 150ms | 250ms | +67% |
+| Min Buffer | 60ms | 120ms | +100% |
+| Underrun Recovery | +2 frames | +4 frames | +100% |
+| Stability Window | 3 sec | 5 sec | +67% |
+| Log Frequency | Every 10 | Every 20 | -50% |
+
+**Expected Results:**
+- ✅ Fewer buffer underruns (target: <5 per session)
+- ✅ Smoother playback without frequent restarts
+- ✅ Better WAN performance (handles 100-200ms latency spikes)
+- ⚠️ Trade-off: ~100ms additional end-to-end latency
+
+*Note: For real-time voice, 250ms latency is still acceptable (typical phone calls: 150-300ms).*
+
+---
+
 ## ✅ Implemented: Google Congestion Control (GCC)
 
 **Date:** 2026-01-03

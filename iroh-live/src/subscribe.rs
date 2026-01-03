@@ -353,7 +353,7 @@ impl AudioTrack {
     ) -> Result<()> {
         use crate::audio::adaptive::AdaptiveJitterBuffer;
 
-        const INITIAL_BUFFER_MS: u32 = 150; // Initial target: 150ms for stable playback
+        const INITIAL_BUFFER_MS: u32 = 250; // Increased from 150ms for WAN stability
         const FRAME_DURATION_MS: u32 = 20; // Typical Opus frame duration
 
         info!(
