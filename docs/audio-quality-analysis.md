@@ -119,3 +119,4 @@ Current timing uses `thread::sleep` which is unreliable. Consider:
 - Implement Google Congestion Control (GCC)
 - Add adaptive bitrate switching based on network conditions
 - Consider SVC for video to enable smooth quality transitions
+
