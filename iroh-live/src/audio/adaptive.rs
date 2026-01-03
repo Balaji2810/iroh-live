@@ -20,6 +20,8 @@ use crate::av::AudioFormat;
 pub struct AdaptiveJitterBuffer {
     /// Buffered audio frames
     buffer: VecDeque<AudioFrame>,
+    /// Leftover samples from previous frame (for partial reads)
+    leftover_samples: Vec<f32>,
     /// Current target buffer size (in number of frames)
     target_buffer_size: usize,
     /// Minimum buffer size before playback starts/resumes
@@ -32,6 +34,8 @@ pub struct AdaptiveJitterBuffer {
     stats: BufferStats,
     /// Jitter estimation (EMA of inter-arrival variance)
     jitter_ema: Option<f32>,
+    /// Expected frame duration in ms (for jitter calculation)
+    expected_interval_ms: f32,
     /// Last packet arrival time
     last_arrival: Option<Instant>,
     /// Number of ticks with stable conditions
@@ -61,26 +65,28 @@ impl AdaptiveJitterBuffer {
     /// * `initial_target_ms` - Initial target buffer depth in milliseconds (e.g., 60ms)
     /// * `frame_duration_ms` - Duration of each audio frame in milliseconds (e.g., 20ms for Opus)
     pub fn new(initial_target_ms: u32, frame_duration_ms: u32) -> Self {
-        let target_frames = (initial_target_ms / frame_duration_ms) as usize;
-        let min_frames = target_frames / 2; // Half of target as minimum
+        let target_frames = (initial_target_ms / frame_duration_ms).max(5) as usize;
+        let min_frames = (target_frames / 2).max(3); // At least 3 frames before playback
         let max_frames = target_frames * 3; // Triple target as maximum
 
         info!(
-            "adaptive jitter buffer: target={}ms ({}frames), min={}ms, max={}ms",
+            "adaptive jitter buffer: target={}ms ({}frames), min={} frames, max={} frames",
             initial_target_ms,
             target_frames,
-            min_frames * frame_duration_ms as usize,
-            max_frames * frame_duration_ms as usize
+            min_frames,
+            max_frames
         );
 
         Self {
             buffer: VecDeque::with_capacity(max_frames),
+            leftover_samples: Vec::new(),
             target_buffer_size: target_frames,
             min_buffer_size: min_frames,
             max_buffer_size: max_frames,
             started_playback: false,
             stats: Default::default(),
             jitter_ema: None,
+            expected_interval_ms: frame_duration_ms as f32,
             last_arrival: None,
             stable_ticks: 0,
         }
@@ -90,18 +96,20 @@ impl AdaptiveJitterBuffer {
     pub fn insert(&mut self, samples: Vec<f32>) {
         let now = Instant::now();
         
-        // Track jitter (inter-arrival time variation)
+        // Track jitter (deviation from expected interval)
         if let Some(last) = self.last_arrival {
             let interval_ms = now.duration_since(last).as_secs_f32() * 1000.0;
+            // Jitter = deviation from expected interval
+            let jitter = (interval_ms - self.expected_interval_ms).abs();
             
             // Update jitter EMA
             match self.jitter_ema {
                 Some(prev_ema) => {
                     // Use a smoothing factor of 0.1 for slow adaptation
-                    self.jitter_ema = Some(0.1 * interval_ms.abs() + 0.9 * prev_ema);
+                    self.jitter_ema = Some(0.1 * jitter + 0.9 * prev_ema);
                 }
                 None => {
-                    self.jitter_ema = Some(interval_ms.abs());
+                    self.jitter_ema = Some(jitter);
                 }
             }
         }
@@ -133,9 +141,10 @@ impl AdaptiveJitterBuffer {
         );
     }
 
-    /// Get audio samples for playback (one frame)
+    /// Get audio samples for playback
     ///
-    /// Returns `None` if buffer is not yet ready or underrun occurred
+    /// Returns exactly `frame_size` samples, handling partial frame consumption.
+    /// Returns `None` only if buffer is not yet ready (initial buffering).
     pub fn get_audio(&mut self, frame_size: usize) -> Option<Vec<f32>> {
         // Adapt buffer size based on observed jitter
         self.adapt_buffer_size();
@@ -144,8 +153,9 @@ impl AdaptiveJitterBuffer {
         if !self.started_playback {
             if self.buffer.len() >= self.min_buffer_size {
                 info!(
-                    "jitter buffer: starting playback with {} frames buffered",
-                    self.buffer.len()
+                    "jitter buffer: starting playback with {} frames buffered (min={})",
+                    self.buffer.len(),
+                    self.min_buffer_size
                 );
                 self.started_playback = true;
             } else {
@@ -158,32 +168,60 @@ impl AdaptiveJitterBuffer {
             }
         }
 
-        // Try to get a frame from the buffer
-        if let Some(frame) = self.buffer.pop_front() {
-            trace!(
-                "jitter buffer: playing frame, remaining={}/{}",
-                self.buffer.len(),
-                self.target_buffer_size
-            );
-            Some(frame.samples)
-        } else {
-            // Underrun occurred
-            self.stats.underruns += 1;
-            warn!(
-                "jitter buffer underrun #{} - no frames available",
-                self.stats.underruns
-            );
-            
-            // Increase target buffer size to prevent future underruns
-            self.target_buffer_size = (self.target_buffer_size + 3).min(self.max_buffer_size);
-            self.stable_ticks = 0;
-
-            // Reset playback to rebuild buffer
-            self.started_playback = false;
-            
-            // Return silence for this frame
-            Some(vec![0.0f32; frame_size])
+        // Build output from leftover samples + new frames as needed
+        let mut output = Vec::with_capacity(frame_size);
+        
+        // First, use any leftover samples from the previous call
+        if !self.leftover_samples.is_empty() {
+            let take = self.leftover_samples.len().min(frame_size);
+            output.extend(self.leftover_samples.drain(..take));
         }
+        
+        // Pull frames from buffer until we have enough samples
+        while output.len() < frame_size {
+            if let Some(frame) = self.buffer.pop_front() {
+                let needed = frame_size - output.len();
+                if frame.samples.len() <= needed {
+                    // Use entire frame
+                    output.extend(&frame.samples);
+                } else {
+                    // Use part of frame, save rest for later
+                    output.extend(&frame.samples[..needed]);
+                    self.leftover_samples.extend(&frame.samples[needed..]);
+                }
+                trace!(
+                    "jitter buffer: consuming frame, remaining={}",
+                    self.buffer.len()
+                );
+            } else {
+                // Underrun - no more frames available
+                self.stats.underruns += 1;
+                
+                // Only log every 10th underrun to avoid spam
+                if self.stats.underruns % 10 == 1 {
+                    warn!(
+                        "jitter buffer underrun #{} - filling with silence ({} samples short)",
+                        self.stats.underruns,
+                        frame_size - output.len()
+                    );
+                }
+                
+                // Increase target buffer size to prevent future underruns
+                self.target_buffer_size = (self.target_buffer_size + 2).min(self.max_buffer_size);
+                self.stable_ticks = 0;
+
+                // Fill remaining with silence
+                output.resize(frame_size, 0.0f32);
+                
+                // Reset playback to rebuild buffer if we're completely empty
+                if self.buffer.is_empty() && self.leftover_samples.is_empty() {
+                    self.started_playback = false;
+                }
+                break;
+            }
+        }
+        
+        Some(output)
     }
 
     /// Adapt buffer size based on network conditions
