@@ -309,7 +309,7 @@ impl AudioTrack {
         span: Span,
     ) -> Result<Self> {
         let _guard = span.enter();
-        let (packet_tx, packet_rx) = mpsc::channel(500); // Increased capacity to prevent backpressure (~5 seconds at 10ms intervals)
+        let (packet_tx, packet_rx) = mpsc::channel(250); // Increased capacity to prevent backpressure (~5 seconds at 10ms intervals)
         let output_format = output.format()?;
         info!(?config, "audio thread start");
         let decoder = D::new(&config, output_format)?;
