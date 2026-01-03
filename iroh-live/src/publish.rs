@@ -3,6 +3,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -465,18 +466,70 @@ impl VideoSource for SharedVideoSource {
 
 pub struct EncoderThread {
     _thread_handle: std::thread::JoinHandle<()>,
+    _writer_task: Arc<AbortOnDropHandle<()>>,
     shutdown: CancellationToken,
 }
 
 impl EncoderThread {
+    /// Spawns an async task that writes frames to the producer
+    fn spawn_async_writer(
+        mut producer: hang::TrackProducer,
+        rx: mpsc::Receiver<hang::Frame>,
+        shutdown: CancellationToken,
+        name: &str,
+    ) -> Arc<AbortOnDropHandle<()>> {
+        let task_name = format!("writer-{}", name);
+        Arc::new(AbortOnDropHandle::new(tokio::spawn(async move {
+            loop {
+                // Check shutdown first
+                if shutdown.is_cancelled() {
+                    break;
+                }
+
+                // Try to receive with a timeout to check shutdown periodically
+                match rx.try_recv() {
+                    Ok(frame) => {
+                        if let Err(err) = producer.write(frame) {
+                            warn!("{}: failed to write frame to producer: {err:#}", task_name);
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        // No data available, yield to prevent busy loop
+                        tokio::task::yield_now().await;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        // Channel closed, encoder thread stopped
+                        debug!("{}: channel disconnected", task_name);
+                        break;
+                    }
+                }
+            }
+            producer.inner.close();
+            debug!("{}: async writer task stopped", task_name);
+        })))
+    }
+
     pub fn spawn_video(
         mut source: impl VideoSource,
         mut encoder: impl VideoEncoderInner,
-        mut producer: hang::TrackProducer,
+        producer: hang::TrackProducer,
         shutdown: CancellationToken,
         span: Span,
     ) -> Self {
         let thread_name = format!("venc-{:<4}-{:<4}", source.name(), encoder.name());
+
+        // Create a bounded channel for async writes
+        // Buffer size: ~1 second of video at 30fps = 30 frames
+        let (tx, rx) = mpsc::sync_channel::<hang::Frame>(30);
+
+        // Spawn async writer task
+        let writer_task = Self::spawn_async_writer(
+            producer,
+            rx,
+            shutdown.clone(),
+            &thread_name,
+        );
+
         let handle = spawn_thread(thread_name, {
             let shutdown = shutdown.clone();
             move || {
@@ -512,14 +565,23 @@ impl EncoderThread {
                             break;
                         };
                         while let Ok(Some(pkt)) = encoder.pop_packet() {
-                            if let Err(err) = producer.write(pkt) {
-                                warn!("failed to write frame to producer: {err:#}");
+                            // Non-blocking send with try_send
+                            match tx.try_send(pkt) {
+                                Ok(_) => {},
+                                Err(mpsc::TrySendError::Full(_)) => {
+                                    // Buffer full - drop frame to avoid blocking
+                                    warn!("video: write buffer full, dropping frame");
+                                }
+                                Err(mpsc::TrySendError::Disconnected(_)) => {
+                                    warn!("video: write channel disconnected");
+                                    break;
+                                }
                             }
                         }
                     }
                     std::thread::sleep(interval.saturating_sub(start.elapsed()));
                 }
-                producer.inner.close();
+                drop(tx); // Close channel to signal writer task
                 if let Err(err) = source.stop() {
                     warn!("video source failed to stop: {err:#}");
                 }
@@ -528,6 +590,7 @@ impl EncoderThread {
         });
         Self {
             _thread_handle: handle,
+            _writer_task: writer_task,
             shutdown,
         }
     }
@@ -535,16 +598,29 @@ impl EncoderThread {
     pub fn spawn_audio(
         mut source: Box<dyn AudioSource>,
         mut encoder: impl AudioEncoderInner,
-        mut producer: hang::TrackProducer,
+        producer: hang::TrackProducer,
         shutdown: CancellationToken,
         span: tracing::Span,
     ) -> Self {
-        let sd = shutdown.clone();
         let thread_name = format!("aenc-{:<4}", encoder.name());
+
+        // Create a bounded channel for async writes
+        // Buffer size: ~1 second of audio at 20ms frames = 50 frames
+        let (tx, rx) = mpsc::sync_channel::<hang::Frame>(50);
+
+        // Spawn async writer task
+        let writer_task = Self::spawn_async_writer(
+            producer,
+            rx,
+            shutdown.clone(),
+            &thread_name,
+        );
+
+        let sd = shutdown.clone();
         let handle = spawn_thread(thread_name, move || {
             let _guard = span.enter();
-            tracing::debug!(config=?encoder.config(), "audio encoder thread start");
             let shutdown = sd;
+            tracing::debug!(config=?encoder.config(), "audio encoder thread start");
             // 20ms framing to align with typical Opus config (48kHz → 960 samples/ch)
             const INTERVAL: Duration = Duration::from_millis(20);
             let format = source.format();
@@ -567,8 +643,17 @@ impl EncoderThread {
                             .pop_packet()
                             .inspect_err(|err| warn!("encoder error: {err:#}"))
                         {
-                            if let Err(err) = producer.write(pkt) {
-                                warn!("failed to write frame to producer: {err:#}");
+                            // Non-blocking send with try_send
+                            match tx.try_send(pkt) {
+                                Ok(_) => {},
+                                Err(mpsc::TrySendError::Full(_)) => {
+                                    // Buffer full - drop frame to avoid blocking
+                                    warn!("audio: write buffer full, dropping frame");
+                                }
+                                Err(mpsc::TrySendError::Disconnected(_)) => {
+                                    warn!("audio: write channel disconnected");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -590,17 +675,17 @@ impl EncoderThread {
                     std::thread::sleep(sleep);
                 }
             }
-            // drain
+            // drain - try to send remaining packets
             while let Ok(Some(pkt)) = encoder.pop_packet() {
-                if let Err(err) = producer.write(pkt) {
-                    warn!("failed to write frame to producer: {err:#}");
-                }
+                // Use try_send even during drain to avoid blocking on shutdown
+                let _ = tx.try_send(pkt);
             }
-            producer.inner.close();
+            drop(tx); // Close channel to signal writer task
             tracing::debug!("audio encoder thread stop");
         });
         Self {
             _thread_handle: handle,
+            _writer_task: writer_task,
             shutdown,
         }
     }
